@@ -27,7 +27,6 @@ mod summary;
 mod watchdog;
 
 use config::Config;
-use constants::UNI_V3_FEE_TIERS;
 use pricing::{raw_to_weth, sushi_v2, uniswap_v3, usd_per_eth, weth_to_raw};
 use provider::{build_http_provider, HttpProvider};
 use strategy::{FirstLeg, MarketState, OpportunityRecord, Venue};
@@ -52,7 +51,7 @@ struct Args {
 /// Static context discovered once at startup.
 struct Ctx {
     v3_pools: Vec<uniswap_v3::V3Pool>,
-    sushi_meta: sushi_v2::PairMeta,
+    sushi_meta: Option<sushi_v2::PairMeta>,
     trade_sizes: Vec<f64>,
     output_file: String,
 }
@@ -93,24 +92,54 @@ async fn run() -> Result<()> {
 
     let http = build_http_provider(&cfg.rpc_http)?;
 
-    // Discover Uniswap V3 pools at startup.
-    info!("Discovering Uniswap V3 pools…");
-    let v3_pools = uniswap_v3::discover_pools(&http, &UNI_V3_FEE_TIERS)
-        .await
-        .context("Pool discovery failed")?;
+    // Discover configured venues:
+    let mut uni_fee_tiers = Vec::new();
+    let mut pancake_fee_tiers = Vec::new();
+    let mut sushi_enabled = false;
 
-    if v3_pools.is_empty() {
-        anyhow::bail!("No UniV3 WETH/USDC pools found — check addresses in constants.rs");
+    for venue in &cfg.venues {
+        match venue {
+            Venue::UniswapV3 { fee } => uni_fee_tiers.push(*fee),
+            Venue::PancakeV3 { fee } => pancake_fee_tiers.push(*fee),
+            Venue::SushiV2 => sushi_enabled = true,
+        }
     }
+
+    let mut v3_pools = Vec::new();
+    if !uni_fee_tiers.is_empty() {
+        info!(tiers = ?uni_fee_tiers, "Discovering Uniswap V3 pools…");
+        let pools = uniswap_v3::discover_uniswap_pools(&http, &uni_fee_tiers)
+            .await
+            .context("Uniswap V3 pool discovery failed")?;
+        v3_pools.extend(pools);
+    }
+
+    if !pancake_fee_tiers.is_empty() {
+        info!(tiers = ?pancake_fee_tiers, "Discovering PancakeSwap V3 pools…");
+        let pools = uniswap_v3::discover_pancake_pools(&http, &pancake_fee_tiers)
+            .await
+            .context("PancakeSwap V3 pool discovery failed")?;
+        v3_pools.extend(pools);
+    }
+
+    let sushi_meta = if sushi_enabled {
+        info!("Loading SushiSwap V2 pair metadata…");
+        let meta = sushi_v2::get_pair_meta(&http)
+            .await
+            .context("Failed to read Sushi pair token ordering")?;
+        info!(weth_is_token0 = meta.weth_is_token0, "Sushi pair meta loaded");
+        Some(meta)
+    } else {
+        None
+    };
+
+    if v3_pools.is_empty() && sushi_meta.is_none() {
+        anyhow::bail!("No active pools discovered — check VENUES configuration and contract addresses");
+    }
+
     for p in &v3_pools {
-        info!(fee = p.fee, pool = %p.address, "Found UniV3 pool");
+        info!(venue = %p.venue, pool = %p.address, "Active pool configured");
     }
-
-    // Determine SushiSwap token ordering once.
-    let sushi_meta = sushi_v2::get_pair_meta(&http)
-        .await
-        .context("Failed to read Sushi pair token ordering")?;
-    info!(weth_is_token0 = sushi_meta.weth_is_token0, "Sushi pair meta loaded");
 
     // Ensure output directory exists.
     if let Some(parent) = Path::new(&cfg.output_file).parent() {
@@ -291,21 +320,25 @@ async fn process_block(
     if dry_run {
         print_prices(&batched.state, &batched.first);
         print_sanity(&batched.first);
-        // Cross-check local Sushi math against the deployed router (+1 RPC call).
-        if let Some(&size) = ctx.trade_sizes.first() {
-            match sushi_v2::cross_check_router(http, &batched.state.sushi, weth_to_raw(size), block).await {
-                Ok(c) => println!(
-                    "Sushi CPF cross-check @ {} WETH: local={} router={} diff={}  {}",
-                    raw_to_weth(c.amount_in),
-                    c.local_out,
-                    c.router_out,
-                    c.local_out.abs_diff(c.router_out),
-                    if c.local_out == c.router_out { "OK (exact)" } else { "MISMATCH" }
-                ),
-                Err(e) => println!(
-                    "Sushi CPF cross-check failed: {}",
-                    provider::redact_urls(&format!("{e:#}"))
-                ),
+        // Cross-check local Sushi math against the deployed router (+1 RPC call) if Sushi is active.
+        if ctx.sushi_meta.is_some() {
+            if let Some(ref sushi_reserves) = batched.state.sushi {
+                if let Some(&size) = ctx.trade_sizes.first() {
+                    match sushi_v2::cross_check_router(http, sushi_reserves, weth_to_raw(size), block).await {
+                        Ok(c) => println!(
+                            "Sushi CPF cross-check @ {} WETH: local={} router={} diff={}  {}",
+                            raw_to_weth(c.amount_in),
+                            c.local_out,
+                            c.router_out,
+                            c.local_out.abs_diff(c.router_out),
+                            if c.local_out == c.router_out { "OK (exact)" } else { "MISMATCH" }
+                        ),
+                        Err(e) => println!(
+                            "Sushi CPF cross-check failed: {}",
+                            provider::redact_urls(&format!("{e:#}"))
+                        ),
+                    }
+                }
             }
         }
         print_spreads(&records);
@@ -325,7 +358,7 @@ async fn process_block(
 /// RPC calls per processed block (continuous mode):
 /// Batch 1 (state + first legs) + Batch 2 (second legs) = 2 Multicall3 aggregate3 calls.
 /// Block numbers arrive via the WS subscription (no extra call).
-/// `--dry-run-once` adds 1 `eth_blockNumber` + 1 router cross-check.
+/// `--dry-run-once` adds 1 `eth_blockNumber` + 1 router cross-check (if Sushi active).
 fn rpc_calls_per_block() -> usize {
     2
 }
@@ -347,11 +380,13 @@ fn print_prices(state: &MarketState, first: &[FirstLeg]) {
             state.liquidity(leg.venue)
         );
     }
-    println!(
-        "SushiV2 reserves: {:.6} WETH / {:.2} USDC",
-        raw_to_weth(state.sushi.reserve_weth),
-        state.sushi.reserve_usdc as f64 / 1e6
-    );
+    if let Some(ref sushi) = state.sushi {
+        println!(
+            "SushiV2 reserves: {:.6} WETH / {:.2} USDC",
+            raw_to_weth(sushi.reserve_weth),
+            sushi.reserve_usdc as f64 / 1e6
+        );
+    }
 }
 
 /// Decimals sanity check: smallest-size price per venue vs the deepest V3 tier.
@@ -363,6 +398,7 @@ fn print_sanity(first: &[FirstLeg]) {
     let Some(reference) = small
         .iter()
         .find(|l| l.venue == Venue::UniswapV3 { fee: 500 })
+        .or_else(|| small.iter().find(|l| l.venue == Venue::PancakeV3 { fee: 500 }))
         .or(small.first())
     else {
         return;

@@ -63,6 +63,30 @@ pub const UNI_V3_SWAP_ROUTER_02: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665F
 /// 500 = 0.05 %, 3000 = 0.30 %, 10000 = 1.00 %
 pub const UNI_V3_FEE_TIERS: [u32; 3] = [500, 3000, 10_000];
 
+// ── PancakeSwap V3 ────────────────────────────────────────────────────────────
+
+/// PancakeSwap V3 Factory on Arbitrum One — used to discover pool addresses via `getPool`.
+/// Source: https://docs.pancakeswap.finance/developers/smart-contracts/pancakeswap-exchange/v3-contracts/arbitrum-deployments
+/// On-chain verified 2026-10-04:
+///   Bytecode size: 10,452 bytes
+///   feeAmountTickSpacing(100) -> 1 (enabled)
+///   feeAmountTickSpacing(500) -> 10 (enabled)
+///   getPool(WETH, USDC, 100) -> 0x7fCDC35463E3770c2fB992716Cd070B63540b947 (holds >100 WETH)
+///   getPool(WETH, USDC, 500) -> 0xd9e2a1a61B6E61b275cEc326465d417e52C1b95c (holds >100 WETH)
+pub const PANCAKE_V3_FACTORY: &str = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865";
+
+/// PancakeSwap V3 QuoterV2 on Arbitrum One — used for off-chain price quotes.
+/// Source: https://docs.pancakeswap.finance/developers/smart-contracts/pancakeswap-exchange/v3-contracts/arbitrum-deployments
+/// On-chain verified 2026-10-04:
+///   Bytecode size: 17,292 bytes
+///   factory() -> 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865 (matches PANCAKE_V3_FACTORY)
+///   WETH9()   -> 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1 (matches WETH constant)
+///   ABI matches Uniswap QuoterV2 quoteExactInputSingle exactly.
+pub const PANCAKE_V3_QUOTER_V2: &str = "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997";
+
+/// Candidate PancakeSwap V3 fee tiers to check (100 = 0.01%, 500 = 0.05%).
+pub const PANCAKE_V3_FEE_TIERS: [u32; 2] = [100, 500];
+
 // ── SushiSwap V2 ─────────────────────────────────────────────────────────────
 
 /// SushiSwap V2 UniswapV2Router02-compatible router on Arbitrum One.

@@ -36,9 +36,10 @@ const MAX_CONCURRENT_RPC: usize = 8;
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// A pricing venue on the WETH/USDC pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Venue {
     UniswapV3 { fee: u32 },
+    PancakeV3 { fee: u32 },
     SushiV2,
 }
 
@@ -46,8 +47,29 @@ impl std::fmt::Display for Venue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Venue::UniswapV3 { fee } => write!(f, "UniV3-{fee}"),
+            Venue::PancakeV3 { fee } => write!(f, "Pancake-{fee}"),
             Venue::SushiV2 => write!(f, "SushiV2"),
         }
+    }
+}
+
+impl std::str::FromStr for Venue {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("SushiV2") {
+            return Ok(Venue::SushiV2);
+        }
+        if let Some(rest) = s.strip_prefix("UniV3-") {
+            let fee = rest.parse::<u32>().context("Invalid UniV3 fee tier")?;
+            return Ok(Venue::UniswapV3 { fee });
+        }
+        if let Some(rest) = s.strip_prefix("Pancake-") {
+            let fee = rest.parse::<u32>().context("Invalid Pancake fee tier")?;
+            return Ok(Venue::PancakeV3 { fee });
+        }
+        anyhow::bail!("Unknown venue: '{s}'. Expected UniV3-<fee>, Pancake-<fee>, or SushiV2");
     }
 }
 
@@ -59,18 +81,20 @@ pub struct MarketState {
     pub block: BlockId,
     /// Discovered V3 pools with their in-range liquidity `L` this block.
     pub v3: Vec<(V3Pool, u128)>,
-    pub sushi: Reserves,
+    pub sushi: Option<Reserves>,
 }
 
 impl MarketState {
-    /// All venues in a fixed order (V3 by fee tier, then Sushi).
+    /// All venues in a deterministic order (V3 pools in discovery order, then Sushi).
     pub fn venues(&self) -> Vec<Venue> {
         let mut v: Vec<Venue> = self
             .v3
             .iter()
-            .map(|(p, _)| Venue::UniswapV3 { fee: p.fee })
+            .map(|(p, _)| p.venue)
             .collect();
-        v.push(Venue::SushiV2);
+        if self.sushi.is_some() {
+            v.push(Venue::SushiV2);
+        }
         v
     }
 
@@ -79,13 +103,13 @@ impl MarketState {
     /// equivalent is sqrt(reserve_weth · reserve_usdc) (V2 = full-range V3).
     pub fn liquidity(&self, venue: Venue) -> u128 {
         match venue {
-            Venue::UniswapV3 { fee } => self
+            Venue::UniswapV3 { .. } | Venue::PancakeV3 { .. } => self
                 .v3
                 .iter()
-                .find(|(p, _)| p.fee == fee)
+                .find(|(p, _)| p.venue == venue)
                 .map(|(_, l)| *l)
                 .unwrap_or(0),
-            Venue::SushiV2 => v2_liquidity(&self.sushi),
+            Venue::SushiV2 => self.sushi.as_ref().map(v2_liquidity).unwrap_or(0),
         }
     }
 }
@@ -177,14 +201,14 @@ pub struct BatchedBlockResult {
 }
 
 /// Process all per-block reads and quotes in exactly 2 Multicall3 `aggregate3` calls:
-/// - Batch 1: Timestamp + V3 pool liquidity + Sushi reserves + all V3 first leg quotes (WETH -> USDC).
+/// - Batch 1: Timestamp + V3/Pancake pool liquidity + optional Sushi reserves + all V3 first leg quotes (WETH -> USDC).
 /// - Batch 2: All V3 second leg quotes (USDC -> WETH) using the exact mid amounts.
 ///
 /// Sushi quotes are calculated locally via constant-product formula (0 RPC calls).
 pub async fn process_block_batched<P: Provider>(
     http: &P,
     v3_pools: &[V3Pool],
-    sushi_meta: crate::pricing::sushi_v2::PairMeta,
+    sushi_meta: Option<crate::pricing::sushi_v2::PairMeta>,
     sizes_weth: &[f64],
     block: BlockId,
 ) -> Result<BatchedBlockResult> {
@@ -197,19 +221,22 @@ pub async fn process_block_batched<P: Provider>(
     // Call 0: Block timestamp
     batch1.push(multicall::build_timestamp_call()?);
 
-    // Calls 1..=n_pools: UniV3 pool liquidity
+    // Calls 1..=n_pools: V3 pool liquidity
     for p in v3_pools {
         batch1.push(uniswap_v3::build_liquidity_call(p.address));
     }
 
-    // Call 1 + n_pools: Sushi getReserves()
-    batch1.push(crate::pricing::sushi_v2::build_reserves_call()?);
+    // Optional Sushi getReserves() call
+    let sushi_included = sushi_meta.is_some();
+    if sushi_included {
+        batch1.push(crate::pricing::sushi_v2::build_reserves_call()?);
+    }
 
-    // Calls for first leg UniV3 quotes: (pool, size)
+    // Calls for first leg V3 quotes: (pool, size)
     for p in v3_pools {
         for &size in sizes_weth {
             let weth_in = U256::from(weth_to_raw(size));
-            batch1.push(uniswap_v3::build_quote_call(p.fee, Side::WethToUsdc, weth_in)?);
+            batch1.push(uniswap_v3::build_quote_call(p.quoter, p.fee, Side::WethToUsdc, weth_in)?);
         }
     }
 
@@ -225,8 +252,12 @@ pub async fn process_block_batched<P: Provider>(
         v3_liq.push((p.clone(), liq));
     }
 
-    let sushi_reserves = crate::pricing::sushi_v2::decode_reserves_result(&res1[1 + n_pools], sushi_meta)
-        .unwrap_or(Reserves { reserve_weth: 0, reserve_usdc: 0 });
+    let (sushi_reserves, mut quote_idx) = if let Some(meta) = sushi_meta {
+        let reserves = crate::pricing::sushi_v2::decode_reserves_result(&res1[1 + n_pools], meta);
+        (reserves, 2 + n_pools)
+    } else {
+        (None, 1 + n_pools)
+    };
 
     let state = MarketState {
         block,
@@ -237,14 +268,13 @@ pub async fn process_block_batched<P: Provider>(
     // Unpack first legs
     let mut first = Vec::new();
 
-    // 1. UniV3 first legs from Batch 1
-    let mut quote_idx = 2 + n_pools;
+    // 1. V3 first legs from Batch 1
     for p in v3_pools {
         for &size in sizes_weth {
             let weth_in = weth_to_raw(size);
             if let Some(usdc_out) = uniswap_v3::decode_quote_result(&res1[quote_idx]) {
                 first.push(FirstLeg {
-                    venue: Venue::UniswapV3 { fee: p.fee },
+                    venue: p.venue,
                     size_weth: size,
                     weth_in,
                     usdc_out: usdc_out.to::<u128>(),
@@ -255,16 +285,18 @@ pub async fn process_block_batched<P: Provider>(
     }
 
     // 2. Sushi first legs (calculated locally off reserves, 0 RPC calls)
-    for &size in sizes_weth {
-        let weth_in = weth_to_raw(size);
-        let usdc_out = state.sushi.weth_to_usdc(weth_in);
-        if usdc_out > 0 {
-            first.push(FirstLeg {
-                venue: Venue::SushiV2,
-                size_weth: size,
-                weth_in,
-                usdc_out,
-            });
+    if let Some(ref sushi) = state.sushi {
+        for &size in sizes_weth {
+            let weth_in = weth_to_raw(size);
+            let usdc_out = sushi.weth_to_usdc(weth_in);
+            if usdc_out > 0 {
+                first.push(FirstLeg {
+                    venue: Venue::SushiV2,
+                    size_weth: size,
+                    weth_in,
+                    usdc_out,
+                });
+            }
         }
     }
 
@@ -282,26 +314,31 @@ pub async fn process_block_batched<P: Provider>(
             match venue_b {
                 Venue::SushiV2 => {
                     // Local Sushi calculation (0 RPC calls)
-                    let weth_back = state.sushi.usdc_to_weth(leg.usdc_out);
-                    if weth_back > 0 {
-                        trips.push(RoundTrip {
-                            venue_a: leg.venue,
-                            venue_b,
-                            size_weth: leg.size_weth,
-                            weth_in: leg.weth_in,
-                            usdc_mid: leg.usdc_out,
-                            weth_back,
-                        });
+                    if let Some(ref sushi) = state.sushi {
+                        let weth_back = sushi.usdc_to_weth(leg.usdc_out);
+                        if weth_back > 0 {
+                            trips.push(RoundTrip {
+                                venue_a: leg.venue,
+                                venue_b,
+                                size_weth: leg.size_weth,
+                                weth_in: leg.weth_in,
+                                usdc_mid: leg.usdc_out,
+                                weth_back,
+                            });
+                        }
                     }
                 }
-                Venue::UniswapV3 { fee } => {
-                    let call = uniswap_v3::build_quote_call(
-                        fee,
-                        Side::UsdcToWeth,
-                        U256::from(leg.usdc_out),
-                    )?;
-                    batch2.push(call);
-                    batch2_meta.push((*leg, venue_b));
+                Venue::UniswapV3 { .. } | Venue::PancakeV3 { .. } => {
+                    if let Some(p) = v3_pools.iter().find(|p| p.venue == venue_b) {
+                        let call = uniswap_v3::build_quote_call(
+                            p.quoter,
+                            p.fee,
+                            Side::UsdcToWeth,
+                            U256::from(leg.usdc_out),
+                        )?;
+                        batch2.push(call);
+                        batch2_meta.push((*leg, venue_b));
+                    }
                 }
             }
         }
@@ -345,13 +382,17 @@ pub async fn quote_on<P: Provider>(
     amount_in: u128,
 ) -> Result<Option<u128>> {
     match venue {
-        Venue::SushiV2 => Ok(Some(match side {
-            Side::WethToUsdc => state.sushi.weth_to_usdc(amount_in),
-            Side::UsdcToWeth => state.sushi.usdc_to_weth(amount_in),
+        Venue::SushiV2 => Ok(state.sushi.as_ref().map(|s| match side {
+            Side::WethToUsdc => s.weth_to_usdc(amount_in),
+            Side::UsdcToWeth => s.usdc_to_weth(amount_in),
         })),
-        Venue::UniswapV3 { fee } => Ok(uniswap_v3::quote(http, state.block, fee, side, U256::from(amount_in))
-            .await?
-            .map(|v| v.to::<u128>())),
+        Venue::UniswapV3 { fee } | Venue::PancakeV3 { fee } => {
+            let pool = state.v3.iter().find(|(p, _)| p.venue == venue).map(|(p, _)| p);
+            let Some(p) = pool else { return Ok(None); };
+            Ok(uniswap_v3::quote(http, p.quoter, state.block, fee, side, U256::from(amount_in))
+                .await?
+                .map(|v| v.to::<u128>()))
+        }
     }
 }
 
@@ -431,6 +472,11 @@ pub fn to_records(
     let order = state.venues();
     let rank = |v: Venue| order.iter().position(|&x| x == v).unwrap_or(usize::MAX);
 
+    let (sushi_reserve_weth, sushi_reserve_usdc) = match &state.sushi {
+        Some(s) => (s.reserve_weth.to_string(), s.reserve_usdc.to_string()),
+        None => ("0".to_string(), "0".to_string()),
+    };
+
     let mut records: Vec<OpportunityRecord> = trips
         .iter()
         .map(|t| {
@@ -453,8 +499,8 @@ pub fn to_records(
                 gross_spread_bps: gross_spread_bps(t.weth_in, t.weth_back),
                 pool_liquidity_a: state.liquidity(a).to_string(),
                 pool_liquidity_b: state.liquidity(b).to_string(),
-                sushi_reserve_weth: state.sushi.reserve_weth.to_string(),
-                sushi_reserve_usdc: state.sushi.reserve_usdc.to_string(),
+                sushi_reserve_weth: sushi_reserve_weth.clone(),
+                sushi_reserve_usdc: sushi_reserve_usdc.clone(),
             }
         })
         .collect();
@@ -559,8 +605,19 @@ mod tests {
     fn records_are_canonical_and_sorted() {
         let state = MarketState {
             block: BlockId::number(1),
-            v3: vec![(V3Pool { fee: 500, address: Address::ZERO }, 42)],
-            sushi: Reserves { reserve_weth: 4 * 10u128.pow(18), reserve_usdc: 9 * 10u128.pow(6) },
+            v3: vec![(
+                V3Pool {
+                    venue: Venue::UniswapV3 { fee: 500 },
+                    fee: 500,
+                    address: Address::ZERO,
+                    quoter: Address::ZERO,
+                },
+                42,
+            )],
+            sushi: Some(Reserves {
+                reserve_weth: 4 * 10u128.pow(18),
+                reserve_usdc: 9 * 10u128.pow(6),
+            }),
         };
         let v3 = Venue::UniswapV3 { fee: 500 };
         let w = 10u128.pow(16);
@@ -587,6 +644,17 @@ mod tests {
         }
         assert_eq!(recs[0].direction, "b_to_a");
         assert_eq!(recs[1].direction, "a_to_b");
+    }
+
+    #[test]
+    fn venue_from_str_and_display() {
+        assert_eq!("UniV3-500".parse::<Venue>().unwrap(), Venue::UniswapV3 { fee: 500 });
+        assert_eq!("UniV3-3000".parse::<Venue>().unwrap(), Venue::UniswapV3 { fee: 3000 });
+        assert_eq!("Pancake-100".parse::<Venue>().unwrap(), Venue::PancakeV3 { fee: 100 });
+        assert_eq!("Pancake-500".parse::<Venue>().unwrap(), Venue::PancakeV3 { fee: 500 });
+        assert_eq!("SushiV2".parse::<Venue>().unwrap(), Venue::SushiV2);
+        assert_eq!(Venue::PancakeV3 { fee: 100 }.to_string(), "Pancake-100");
+        assert_eq!(Venue::PancakeV3 { fee: 500 }.to_string(), "Pancake-500");
     }
 
     #[test]

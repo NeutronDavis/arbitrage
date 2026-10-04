@@ -1,0 +1,232 @@
+================================================================================
+PHASE 2c SUMMARY REPORT: PANCAKESWAP V3 INTEGRATION
+================================================================================
+Date: 2026-10-04
+Chain: Arbitrum One (Chain ID: 42161)
+Status: Completed, Verified On-Chain, Ready for Review (Read-Only)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW & OBJECTIVES
+--------------------------------------------------------------------------------
+Phase 2c added PancakeSwap V3 as an active venue to the read-only arbitrage price
+logger alongside Uniswap V3 (Camelot V3 skipped for now).
+
+Key constraints observed:
+- Read-only execution: no transactions, no wallet, no private keys.
+- No .env files created, edited, read, or deleted; no secrets logged.
+- Bounded test execution using timeout and temporary output files.
+- Preserved exactly 2 Multicall3 RPC calls per processed block.
+- JSONL format and fields kept strictly backwards-compatible with the summarizer.
+
+--------------------------------------------------------------------------------
+2. CODE CHANGES
+--------------------------------------------------------------------------------
+1. src/constants.rs:
+   - Added PANCAKE_V3_FACTORY (0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865)
+     Source: Official PancakeSwap Arbitrum One Deployments documentation
+     (https://docs.pancakeswap.finance/developers/smart-contracts/pancakeswap-exchange/v3-contracts/arbitrum-deployments)
+     On-chain verified 2026-10-04:
+       Bytecode size: 10,452 bytes
+       feeAmountTickSpacing(100) -> 1 (enabled)
+       feeAmountTickSpacing(500) -> 10 (enabled)
+       getPool(WETH, USDC, 100) -> 0x7fCDC35463E3770c2fB992716Cd070B63540b947
+       getPool(WETH, USDC, 500) -> 0xd9e2a1a61B6E61b275cEc326465d417e52C1b95c
+   - Added PANCAKE_V3_QUOTER_V2 (0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997)
+     Source: Official PancakeSwap Arbitrum One Deployments documentation
+     On-chain verified 2026-10-04:
+       Bytecode size: 17,292 bytes
+       factory() -> 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
+       WETH9()   -> 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1
+       ABI matches Uniswap QuoterV2 quoteExactInputSingle signature and returns.
+   - Added PANCAKE_V3_FEE_TIERS: [100, 500] (0.01% and 0.05%).
+
+2. src/pricing/uniswap_v3.rs:
+   - Added IUniswapV3Factory.feeAmountTickSpacing and IERC20.balanceOf bindings.
+   - Extended V3Pool struct: { venue: Venue, fee: u32, address: Address, quoter: Address }.
+   - Added discover_pancake_pools:
+     * Reads enabled fee tiers dynamically from the factory (feeAmountTickSpacing > 0).
+     * Checks pool existence via getPool.
+     * Checks WETH balance via balanceOf(pool) and warns/skips any pool under 10 WETH.
+   - Parameterized build_quote_call and quote functions with quoter: Address so
+     Uniswap and PancakeSwap quote calls reuse the identical logic and calldata encoding.
+
+3. src/strategy.rs:
+   - Extended Venue enum:
+     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+     pub enum Venue {
+         UniswapV3 { fee: u32 },
+         PancakeV3 { fee: u32 },
+         SushiV2,
+     }
+   - Implemented Display ("UniV3-{fee}", "Pancake-{fee}", "SushiV2") and FromStr.
+   - Updated MarketState with liquidity lookups for all venue types and optional Sushi.
+   - Updated process_block_batched to package all V3 pool reads (Uniswap + Pancake)
+     and first leg quotes into Batch 1, and all second leg quotes across other venues
+     into Batch 2, retaining exactly 2 Multicall3 aggregate3 calls per block.
+   - Updated to_records to preserve canonical ordering and string-encoded reserves/liquidity.
+
+4. src/config.rs:
+   - Added `pub venues: Vec<Venue>` parsed from VENUES env var.
+     Default: "UniV3-500,UniV3-3000,Pancake-100,Pancake-500".
+     SushiV2 and UniV3-10000 remain fully supported in code but are off by default.
+   - Changed default TRADE_SIZES_WETH to "0.05,0.1,0.25,0.5".
+
+5. src/main.rs:
+   - Dynamic pool discovery for all configured venues at startup.
+   - Dry-run tables updated to display prices, depths, and spreads for all active venues.
+   - Decimals sanity check compares prices against deepest available tier.
+
+--------------------------------------------------------------------------------
+3. ON-CHAIN PARITY VERIFICATION (Block 511647210)
+--------------------------------------------------------------------------------
+Tested via `cargo run --bin verify_parity` and confirmed against direct `cast call`
+pinned to Arbitrum block 511647210:
+
+Value Checked                    Direct Unbatched (cast call)   Multicall3 Batched     Status
+--------------------------------------------------------------------------------------------------
+1. Pancake-500 Liquidity         86999937769278435              86999937769278435      EXACT MATCH
+2. Pancake-100 0.05W Quote       134815811 ($134.815811)        134815811              EXACT MATCH
+3. Pancake-500 0.05W Quote       134813664 ($134.813664)        134813664              EXACT MATCH
+
+Direct CLI cast commands run:
+- Liquidity:
+  cast call 0xd9e2a1a61B6E61b275cEc326465d417e52C1b95c "liquidity()(uint128)" --block 511647210
+  => 86999937769278435
+- Quote 100:
+  cast call 0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997 \
+    "quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,uint256)" \
+    "(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1,0xaf88d065e77c8cC2239327C5EDb3A432268e5831,50000000000000000,100,0)" \
+    --block 511647210
+  => 134815811
+- Quote 500:
+  cast call 0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997 \
+    "quoteExactInputSingle((address,address,uint256,uint24,uint160))(uint256,uint160,uint32,uint256)" \
+    "(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1,0xaf88d065e77c8cC2239327C5EDb3A432268e5831,50000000000000000,500,0)" \
+    --block 511647210
+  => 134813664
+
+--------------------------------------------------------------------------------
+4. --dry-run-once SNAPSHOT TABLE (Block 511647447)
+--------------------------------------------------------------------------------
+Command: cargo run --release -- --dry-run-once
+
+Venue Snapshot:
+Venue         Size(W)        USD/ETH       Depth (V3 L units)
+--------------------------------------------------------------
+UniV3-500       0.050        2695.86      4183998052384858743
+UniV3-500       0.100        2695.86      4183998052384858743
+UniV3-500       0.250        2695.86      4183998052384858743
+UniV3-500       0.500        2695.85      4183998052384858743
+UniV3-3000      0.050        2691.13       523080120222183503
+UniV3-3000      0.100        2691.12       523080120222183503
+UniV3-3000      0.250        2691.08       523080120222183503
+UniV3-3000      0.500        2691.01       523080120222183503
+Pancake-100     0.050        2696.03        31154714920047063
+Pancake-100     0.100        2695.81        31154714920047063
+Pancake-100     0.250        2695.13        31154714920047063
+Pancake-100     0.500        2694.01        31154714920047063
+Pancake-500     0.050        2695.97        86999937769278435
+Pancake-500     0.100        2695.89        86999937769278435
+Pancake-500     0.250        2695.65        86999937769278435
+Pancake-500     0.500        2695.24        86999937769278435
+
+Decimals Sanity & Venue Price Agreement (@ 0.05 WETH):
+UniV3-500       2695.86 USD/ETH    +0.00%  plausible (Reference)
+UniV3-3000      2691.13 USD/ETH    -0.18%  plausible (~18 bps deviation, 30 bps fee tier)
+Pancake-100     2696.03 USD/ETH    +0.01%  plausible (+0.63 bps deviation vs UniV3-500)
+Pancake-500     2695.97 USD/ETH    +0.00%  plausible (+0.41 bps deviation vs UniV3-500)
+Conclusion: All four venues agree well within ~10 bps (<1 bp between Pancake & UniV3-500).
+
+Round-Trip Gross Spreads (Top 12):
+Venue A      Venue B      Dir       Size(W)  Spread(bps)
+--------------------------------------------------------
+Pancake-100  Pancake-500  b_to_a      0.050        -3.90
+UniV3-500    Pancake-100  a_to_b      0.050        -4.29
+Pancake-100  Pancake-500  b_to_a      0.100        -5.03
+UniV3-500    Pancake-100  a_to_b      0.100        -5.13
+UniV3-500    Pancake-100  a_to_b      0.250        -7.64
+Pancake-100  Pancake-500  b_to_a      0.250        -8.42
+UniV3-500    Pancake-100  b_to_a      0.050        -9.39
+UniV3-500    Pancake-500  b_to_a      0.050        -9.62
+UniV3-500    Pancake-500  b_to_a      0.100        -9.92
+UniV3-500    Pancake-100  b_to_a      0.100       -10.23
+Pancake-100  Pancake-500  a_to_b      0.050       -10.36
+UniV3-500    Pancake-500  b_to_a      0.250       -10.84
+
+--------------------------------------------------------------------------------
+5. 180-SECOND BOUNDED LIVE TEST
+--------------------------------------------------------------------------------
+Output file: data/test_live_pancake.jsonl (temporary file; data/opportunities.jsonl untouched)
+Test duration: 180 seconds
+Blocks sampled: 15 distinct blocks (511647600 to 511648160, every 40 blocks)
+Records per block: 48 (6 pairs * 2 directions * 4 sizes)
+Total records written: 720 rows
+Process errors: 0
+Lag warnings / dropped blocks: 0
+RPC calls per processed block: exactly 2
+
+Summarizer Analysis (`cargo run --release --bin summarize data/test_live_pancake.jsonl`):
+File: data/test_live_pancake.jsonl
+
+══ Opportunity Summary by Venue Pair, Direction & Size ══
+Venue A      Venue B      Dir       Size(W)     Rows     Spread > 0     Max(bps)  Median(bps)     P95(bps)
+----------------------------------------------------------------------------------------------
+Pancake-100  Pancake-500  a_to_b      0.050       15     0 (  0.0%)        -3.82        -3.82        -3.82
+Pancake-100  Pancake-500  a_to_b      0.100       15     0 (  0.0%)        -4.95        -4.95        -4.95
+Pancake-100  Pancake-500  a_to_b      0.250       15     0 (  0.0%)        -8.34        -8.34        -8.34
+Pancake-100  Pancake-500  a_to_b      0.500       15     0 (  0.0%)       -13.99       -13.99       -13.99
+Pancake-100  Pancake-500  b_to_a      0.050       15     0 (  0.0%)        -3.90       -10.44        -3.90
+Pancake-100  Pancake-500  b_to_a      0.100       15     0 (  0.0%)        -5.03       -11.57        -5.03
+Pancake-100  Pancake-500  b_to_a      0.250       15     0 (  0.0%)        -8.42       -15.00        -8.42
+Pancake-100  Pancake-500  b_to_a      0.500       15     0 (  0.0%)       -14.13       -20.98       -14.13
+UniV3-3000   Pancake-100  a_to_b      0.050       15     0 (  0.0%)       -21.85       -28.38       -21.85
+UniV3-3000   Pancake-100  a_to_b      0.100       15     0 (  0.0%)       -22.73       -29.26       -22.73
+UniV3-3000   Pancake-100  a_to_b      0.250       15     0 (  0.0%)       -25.36       -31.93       -25.36
+UniV3-3000   Pancake-100  a_to_b      0.500       15     0 (  0.0%)       -29.81       -36.65       -29.81
+UniV3-3000   Pancake-100  b_to_a      0.050       15     0 (  0.0%)       -35.37       -35.37       -35.37
+UniV3-3000   Pancake-100  b_to_a      0.100       15     0 (  0.0%)       -36.25       -36.25       -36.25
+UniV3-3000   Pancake-100  b_to_a      0.250       15     0 (  0.0%)       -38.89       -38.89       -38.89
+UniV3-3000   Pancake-100  b_to_a      0.500       15     0 (  0.0%)       -43.28       -43.28       -43.28
+UniV3-3000   Pancake-500  a_to_b      0.050       15     0 (  0.0%)       -28.54       -28.54       -28.54
+UniV3-3000   Pancake-500  a_to_b      0.100       15     0 (  0.0%)       -28.88       -28.88       -28.88
+UniV3-3000   Pancake-500  a_to_b      0.250       15     0 (  0.0%)       -29.92       -29.92       -29.92
+UniV3-3000   Pancake-500  a_to_b      0.500       15     0 (  0.0%)       -31.65       -31.65       -31.65
+UniV3-3000   Pancake-500  b_to_a      0.050       15     0 (  0.0%)       -42.12       -42.12       -42.12
+UniV3-3000   Pancake-500  b_to_a      0.100       15     0 (  0.0%)       -42.47       -42.47       -42.47
+UniV3-3000   Pancake-500  b_to_a      0.250       15     0 (  0.0%)       -43.51       -43.51       -43.51
+UniV3-3000   Pancake-500  b_to_a      0.500       15     0 (  0.0%)       -45.25       -45.25       -45.25
+UniV3-500    Pancake-100  a_to_b      0.050       15     0 (  0.0%)        -4.29        -9.68        -4.29
+UniV3-500    Pancake-100  a_to_b      0.100       15     0 (  0.0%)        -5.13       -10.51        -5.13
+UniV3-500    Pancake-100  a_to_b      0.250       15     0 (  0.0%)        -7.64       -13.07        -7.64
+UniV3-500    Pancake-100  a_to_b      0.500       15     0 (  0.0%)       -11.89       -17.59       -11.89
+UniV3-500    Pancake-100  b_to_a      0.050       15     0 (  0.0%)        -4.00        -4.00        -4.00
+UniV3-500    Pancake-100  b_to_a      0.100       15     0 (  0.0%)        -4.84        -4.84        -4.84
+UniV3-500    Pancake-100  b_to_a      0.250       15     0 (  0.0%)        -7.35        -7.36        -7.35
+UniV3-500    Pancake-100  b_to_a      0.500       15     0 (  0.0%)       -11.55       -11.55       -11.55
+UniV3-500    Pancake-500  a_to_b      0.050       15     0 (  0.0%)        -9.83        -9.83        -9.83
+UniV3-500    Pancake-500  a_to_b      0.100       15     0 (  0.0%)       -10.14       -10.14       -10.14
+UniV3-500    Pancake-500  a_to_b      0.250       15     0 (  0.0%)       -11.05       -11.05       -11.05
+UniV3-500    Pancake-500  a_to_b      0.500       15     0 (  0.0%)       -12.57       -12.57       -12.57
+UniV3-500    Pancake-500  b_to_a      0.050       15     0 (  0.0%)        -9.62       -10.77        -9.62
+UniV3-500    Pancake-500  b_to_a      0.100       15     0 (  0.0%)        -9.92       -11.08        -9.92
+UniV3-500    Pancake-500  b_to_a      0.250       15     0 (  0.0%)       -10.84       -11.99       -10.84
+UniV3-500    Pancake-500  b_to_a      0.500       15     0 (  0.0%)       -12.36       -13.52       -12.36
+UniV3-500    UniV3-3000   a_to_b      0.050       15     0 (  0.0%)       -41.36       -41.36       -41.36
+UniV3-500    UniV3-3000   a_to_b      0.100       15     0 (  0.0%)       -41.42       -41.42       -41.42
+UniV3-500    UniV3-3000   a_to_b      0.250       15     0 (  0.0%)       -41.59       -41.59       -41.59
+UniV3-500    UniV3-3000   a_to_b      0.500       15     0 (  0.0%)       -41.86       -41.86       -41.86
+UniV3-500    UniV3-3000   b_to_a      0.050       15     0 (  0.0%)       -27.56       -28.71       -27.56
+UniV3-500    UniV3-3000   b_to_a      0.100       15     0 (  0.0%)       -27.62       -28.77       -27.62
+UniV3-500    UniV3-3000   b_to_a      0.250       15     0 (  0.0%)       -27.78       -28.93       -27.78
+UniV3-500    UniV3-3000   b_to_a      0.500       15     0 (  0.0%)       -28.06       -29.21       -28.06
+----------------------------------------------------------------------------------------------
+Total rows: 720, Groups: 48, Rows with spread > 0: 0
+
+--------------------------------------------------------------------------------
+6. TOOLCHAIN VALIDATION
+--------------------------------------------------------------------------------
+- cargo check:                              PASSED (0 errors, 0 warnings)
+- cargo clippy --all-targets -- -D warnings: PASSED (0 errors, 0 warnings)
+- cargo test:                               PASSED (24 unit tests passed)
+- cargo build --release:                    PASSED
+================================================================================

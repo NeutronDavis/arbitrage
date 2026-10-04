@@ -18,7 +18,8 @@ use anyhow::{anyhow, Result};
 use futures_util::future::try_join_all;
 use tracing::warn;
 
-use crate::constants::{UNI_V3_FACTORY, UNI_V3_QUOTER_V2, USDC, WETH};
+use crate::constants::{PANCAKE_V3_FACTORY, PANCAKE_V3_QUOTER_V2, UNI_V3_FACTORY, UNI_V3_QUOTER_V2, USDC, WETH};
+use crate::strategy::Venue;
 
 // ── sol! bindings ─────────────────────────────────────────────────────────────
 
@@ -27,6 +28,15 @@ sol! {
     interface IUniswapV3Factory {
         function getPool(address tokenA, address tokenB, uint24 fee)
             external view returns (address pool);
+        function feeAmountTickSpacing(uint24 fee)
+            external view returns (int24);
+    }
+}
+
+sol! {
+    #[sol(rpc)]
+    interface IERC20 {
+        function balanceOf(address account) external view returns (uint256);
     }
 }
 
@@ -62,8 +72,10 @@ sol! {
 
 #[derive(Debug, Clone)]
 pub struct V3Pool {
+    pub venue: Venue,
     pub fee: u32,
     pub address: Address,
+    pub quoter: Address,
 }
 
 /// Swap direction on the WETH/USDC pair.
@@ -75,11 +87,13 @@ pub enum Side {
 
 // ── Pool discovery ────────────────────────────────────────────────────────────
 
-pub async fn discover_pools<P: Provider>(
+/// Discover Uniswap V3 pools at startup.
+pub async fn discover_uniswap_pools<P: Provider>(
     http: &P,
     fee_tiers: &[u32],
 ) -> Result<Vec<V3Pool>> {
     let factory_addr: Address = UNI_V3_FACTORY.parse()?;
+    let quoter_addr: Address = UNI_V3_QUOTER_V2.parse()?;
     let weth_addr: Address = WETH.parse()?;
     let usdc_addr: Address = USDC.parse()?;
     let factory = IUniswapV3Factory::new(factory_addr, http);
@@ -90,15 +104,104 @@ pub async fn discover_pools<P: Provider>(
             .getPool(weth_addr, usdc_addr, U24::from(fee))
             .call()
             .await
-            .map_err(|e| anyhow!("getPool(fee={fee}) failed: {e}"))?;
+            .map_err(|e| anyhow!("UniV3 getPool(fee={fee}) failed: {e}"))?;
 
         if pool_addr == Address::ZERO {
             warn!(fee, "UniV3 pool does not exist — skipping tier");
             continue;
         }
-        pools.push(V3Pool { fee, address: pool_addr });
+        pools.push(V3Pool {
+            venue: Venue::UniswapV3 { fee },
+            fee,
+            address: pool_addr,
+            quoter: quoter_addr,
+        });
     }
     Ok(pools)
+}
+
+/// Discover PancakeSwap V3 pools at startup from factory for fee tiers 100 and 500.
+///
+/// Reads enabled fee tiers dynamically from the factory (`feeAmountTickSpacing > 0`).
+/// Checks WETH balance of each pool and skips with a warning if under 10 WETH.
+pub async fn discover_pancake_pools<P: Provider>(
+    http: &P,
+    fee_tiers: &[u32],
+) -> Result<Vec<V3Pool>> {
+    let factory_addr: Address = PANCAKE_V3_FACTORY.parse()?;
+    let quoter_addr: Address = PANCAKE_V3_QUOTER_V2.parse()?;
+    let weth_addr: Address = WETH.parse()?;
+    let usdc_addr: Address = USDC.parse()?;
+    let factory = IUniswapV3Factory::new(factory_addr, http);
+    let weth_token = IERC20::new(weth_addr, http);
+
+    let min_balance = U256::from(10) * U256::from(10).pow(U256::from(18)); // 10 WETH
+
+    let mut pools = Vec::new();
+    for &fee in fee_tiers {
+        // 1. Read enabled tiers dynamically from factory
+        let tick_spacing = match factory.feeAmountTickSpacing(U24::from(fee)).call().await {
+            Ok(ts) => ts,
+            Err(e) => {
+                let msg = crate::provider::redact_urls(&e.to_string());
+                warn!(fee, error = %msg, "Pancake feeAmountTickSpacing check failed — skipping");
+                continue;
+            }
+        };
+
+        let ts_i32: i32 = tick_spacing.as_i32();
+        if ts_i32 <= 0 {
+            warn!(fee, tick_spacing = ts_i32, "Pancake fee tier is not enabled on factory — skipping");
+            continue;
+        }
+
+        // 2. Query pool address
+        let pool_addr = factory
+            .getPool(weth_addr, usdc_addr, U24::from(fee))
+            .call()
+            .await
+            .map_err(|e| anyhow!("Pancake getPool(fee={fee}) failed: {e}"))?;
+
+        if pool_addr == Address::ZERO {
+            warn!(fee, "Pancake pool does not exist — skipping tier");
+            continue;
+        }
+
+        // 3. Skip with a warning any pool whose WETH balance is under 10 WETH
+        let weth_balance = weth_token
+            .balanceOf(pool_addr)
+            .call()
+            .await
+            .map_err(|e| anyhow!("balanceOf on {pool_addr} failed: {e}"))?;
+
+        if weth_balance < min_balance {
+            let bal_f64 = weth_balance.to::<u128>() as f64 / 1e18;
+            warn!(
+                fee,
+                pool = %pool_addr,
+                balance_weth = bal_f64,
+                "Pancake pool WETH balance under 10 WETH — skipping"
+            );
+            continue;
+        }
+
+        pools.push(V3Pool {
+            venue: Venue::PancakeV3 { fee },
+            fee,
+            address: pool_addr,
+            quoter: quoter_addr,
+        });
+    }
+    Ok(pools)
+}
+
+/// Backwards-compatible pool discovery helper (discovers Uniswap V3 pools).
+#[allow(dead_code)]
+pub async fn discover_pools<P: Provider>(
+    http: &P,
+    fee_tiers: &[u32],
+) -> Result<Vec<V3Pool>> {
+    discover_uniswap_pools(http, fee_tiers).await
 }
 
 // ── Per-block reads (legacy / comparison) ────────────────────────────────────
@@ -122,19 +225,19 @@ pub async fn fetch_liquidity<P: Provider>(
     .await
 }
 
-/// Exact-input single-hop quote from QuoterV2 (one `eth_call`).
+/// Exact-input single-hop quote from QuoterV2 (one `eth_call`), parameterized by quoter address.
 ///
 /// Returns `Ok(None)` when the quoter reverts (e.g. not enough liquidity for
 /// the size); the caller skips that combination rather than aborting the block.
 #[allow(dead_code)]
 pub async fn quote<P: Provider>(
     http: &P,
+    quoter_addr: Address,
     block: BlockId,
     fee: u32,
     side: Side,
     amount_in: U256,
 ) -> Result<Option<U256>> {
-    let quoter_addr: Address = UNI_V3_QUOTER_V2.parse()?;
     let weth_addr: Address = WETH.parse()?;
     let usdc_addr: Address = USDC.parse()?;
     let (token_in, token_out) = match side {
@@ -158,7 +261,7 @@ pub async fn quote<P: Provider>(
         Err(e) => {
             // Error text may embed the transport URL; redact before logging.
             let msg = crate::provider::redact_urls(&e.to_string());
-            warn!(fee, ?side, error = %msg, "quoteExactInputSingle failed — skipping");
+            warn!(fee, ?side, quoter = %quoter_addr, error = %msg, "quoteExactInputSingle failed — skipping");
             Ok(None)
         }
     }
@@ -188,9 +291,8 @@ pub fn decode_liquidity_result(res: &MulticallResult) -> Option<u128> {
         .ok()
 }
 
-/// Build a Multicall3 call for `IQuoterV2.quoteExactInputSingle()`.
-pub fn build_quote_call(fee: u32, side: Side, amount_in: U256) -> Result<Call3> {
-    let quoter_addr: Address = UNI_V3_QUOTER_V2.parse()?;
+/// Build a Multicall3 call for `IQuoterV2.quoteExactInputSingle()`, parameterized by quoter address.
+pub fn build_quote_call(quoter_addr: Address, fee: u32, side: Side, amount_in: U256) -> Result<Call3> {
     let weth_addr: Address = WETH.parse()?;
     let usdc_addr: Address = USDC.parse()?;
     let (token_in, token_out) = match side {
