@@ -1,0 +1,19 @@
+# Secrets — NEVER commit real values
+.env
+
+# Rust build artefacts
+target/
+
+# Foundry build artefacts
+out/
+cache/
+broadcast/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

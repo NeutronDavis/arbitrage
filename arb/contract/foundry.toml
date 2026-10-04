@@ -1,0 +1,18 @@
+[profile.default]
+src     = "src"
+out     = "out"
+libs    = ["lib"]
+test    = "test"
+script  = "script"
+solc    = "0.8.20"
+
+# Arbitrum One fork — set ARBITRUM_RPC_URL in your shell or .env before running.
+# Usage: forge test --fork-url $ARBITRUM_RPC_URL
+[profile.default.fuzz]
+runs = 256
+
+[rpc_endpoints]
+arbitrum = "${ARBITRUM_RPC_URL}"
+
+[etherscan]
+arbitrum = { key = "${ARBISCAN_API_KEY}", chain = 42161 }
