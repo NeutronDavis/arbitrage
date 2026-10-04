@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use futures_util::StreamExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -70,45 +70,102 @@ async fn build_ws_provider(url: &str) -> Result<alloy::providers::RootProvider> 
 /// Subscribe to new blocks over WebSocket, calling `on_block` for each block number.
 ///
 /// On connection drop, reconnects with exponential backoff (1 s → 30 s).
-pub async fn run_block_loop<F, Fut>(
+/// `on_subscribe` is invoked every time a block subscription is established.
+pub async fn run_block_loop<S, F, Fut>(
     ws_url: &str,
     http: &HttpProvider,
+    on_subscribe: S,
     mut on_block: F,
 ) -> Result<()>
 where
+    S: Fn(),
     F: FnMut(&HttpProvider, u64) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
     let mut backoff_secs: u64 = 1;
+    let mut connection_count: u64 = 0;
+    let mut last_block_time: Option<Instant> = None;
 
     loop {
         match build_ws_provider(ws_url).await {
             Err(e) => {
-                error!(error = %redact_urls(&format!("{e:#}")), "WebSocket connect failed; retry in {backoff_secs}s");
+                let secs_since_last_block = last_block_time
+                    .map(|t| format!("{}s", t.elapsed().as_secs()))
+                    .unwrap_or_else(|| "none (no blocks received yet)".to_string());
+                if connection_count > 0 {
+                    warn!(
+                        secs_since_last_block = %secs_since_last_block,
+                        retry_in_secs = backoff_secs,
+                        error = %redact_urls(&format!("{e:#}")),
+                        "WebSocket reconnect failed; retrying in {backoff_secs}s"
+                    );
+                } else {
+                    error!(
+                        error = %redact_urls(&format!("{e:#}")),
+                        "WebSocket connect failed; retry in {backoff_secs}s"
+                    );
+                }
                 sleep(Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(30);
                 continue;
             }
             Ok(ws_provider) => {
-                info!("WebSocket connected; subscribing to blocks");
-                backoff_secs = 1;
-
                 match ws_provider.subscribe_blocks().await {
                     Err(e) => {
-                        error!(error = %redact_urls(&format!("{e:#}")), "subscribe_blocks failed; reconnecting");
+                        let secs_since_last_block = last_block_time
+                            .map(|t| format!("{}s", t.elapsed().as_secs()))
+                            .unwrap_or_else(|| "none (no blocks received yet)".to_string());
+                        if connection_count > 0 {
+                            warn!(
+                                secs_since_last_block = %secs_since_last_block,
+                                retry_in_secs = backoff_secs,
+                                error = %redact_urls(&format!("{e:#}")),
+                                "subscribe_blocks failed on reconnect; retrying in {backoff_secs}s"
+                            );
+                        } else {
+                            error!(
+                                error = %redact_urls(&format!("{e:#}")),
+                                "subscribe_blocks failed; reconnecting"
+                            );
+                        }
                         sleep(Duration::from_secs(backoff_secs)).await;
                         backoff_secs = (backoff_secs * 2).min(30);
                         continue;
                     }
                     Ok(sub) => {
+                        connection_count += 1;
+                        if connection_count > 1 {
+                            let secs_since_last_block = last_block_time
+                                .map(|t| format!("{}s", t.elapsed().as_secs()))
+                                .unwrap_or_else(|| "none (no blocks received yet)".to_string());
+                            warn!(
+                                secs_since_last_block = %secs_since_last_block,
+                                reconnect_count = connection_count - 1,
+                                "WebSocket reconnected; subscribing to blocks"
+                            );
+                        } else {
+                            info!("WebSocket connected; subscribing to blocks");
+                        }
+                        backoff_secs = 1;
+                        on_subscribe();
+
                         let mut stream = sub.into_stream();
                         while let Some(header) = stream.next().await {
+                            last_block_time = Some(Instant::now());
                             let block_num = header.number;
                             if let Err(e) = on_block(http, block_num).await {
                                 warn!(block = block_num, error = %redact_urls(&format!("{e:#}")), "per-block handler error");
                             }
                         }
-                        warn!("Block stream ended; reconnecting in {backoff_secs}s");
+
+                        let secs_since_last_block = last_block_time
+                            .map(|t| format!("{}s", t.elapsed().as_secs()))
+                            .unwrap_or_else(|| "none (no blocks received yet)".to_string());
+                        warn!(
+                            secs_since_last_block = %secs_since_last_block,
+                            reconnect_in_secs = backoff_secs,
+                            "WebSocket block stream ended; reconnecting in {backoff_secs}s"
+                        );
                         sleep(Duration::from_secs(backoff_secs)).await;
                         backoff_secs = (backoff_secs * 2).min(30);
                     }

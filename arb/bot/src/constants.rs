@@ -17,6 +17,17 @@ pub const WETH: &str = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 /// and https://www.circle.com/blog/usdc-now-available-natively-on-arbitrum
 pub const USDC: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 
+// ── Multicall3 ────────────────────────────────────────────────────────────────
+
+/// Multicall3 on Arbitrum One (chain ID 42161).
+/// Canonical address deployed across EVM chains via CREATE2.
+/// Source: https://github.com/mds1/multicall3/blob/main/deployments.json
+/// On-chain verified:
+///   Bytecode size: 3808 bytes
+///   Codehash: 0xd5c15df687b16f2ff992fc8d767b4216323184a2bbc6ee2f9c398c318e770891 (matches Ethereum mainnet)
+///   Multicall3.getChainId() -> 42161
+pub const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
 // ── Balancer V2 ───────────────────────────────────────────────────────────────
 
 /// Balancer V2 Vault — the flash loan entry-point.

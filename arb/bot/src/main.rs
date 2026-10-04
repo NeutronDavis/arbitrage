@@ -12,17 +12,19 @@ use alloy::eips::BlockId;
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::io::Write;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 mod config;
 mod constants;
 mod executor;
 mod logging;
+mod multicall;
 mod pricing;
 mod provider;
 mod strategy;
+mod summary;
+mod watchdog;
 
 use config::Config;
 use constants::UNI_V3_FEE_TIERS;
@@ -41,6 +43,10 @@ struct Args {
     /// Fetch quotes for exactly one block, print a human-readable table, then exit.
     #[arg(long, default_value_t = false)]
     dry_run_once: bool,
+
+    /// Summarise a JSONL opportunity log and exit.
+    #[arg(long)]
+    summarize: Option<Option<String>>,
 }
 
 /// Static context discovered once at startup.
@@ -66,6 +72,18 @@ async fn main() {
 async fn run() -> Result<()> {
     logging::init()?;
     let args = Args::parse();
+
+    // If --summarize is requested, run analysis and exit immediately without RPC connection.
+    if let Some(path_opt) = args.summarize {
+        let path = path_opt.unwrap_or_else(|| "data/opportunities.jsonl".into());
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("Cannot open JSONL file: {path}"))?;
+        let stats = summary::summarize_reader(std::io::BufReader::new(file))?;
+        println!("File: {path}");
+        summary::print_summary(&stats);
+        return Ok(());
+    }
+
     let cfg = Config::from_env().context("Failed to load configuration")?;
 
     // Safety check: never run transactions in Phase 2.
@@ -100,11 +118,11 @@ async fn run() -> Result<()> {
             .with_context(|| format!("Cannot create output dir {:?}", parent))?;
     }
 
-    let calls = rpc_calls_per_block(v3_pools.len(), cfg.trade_sizes_weth.len());
+    let calls = rpc_calls_per_block();
     info!(
         rpc_calls_per_processed_block = calls,
         log_every_n_blocks = cfg.log_every_n_blocks,
-        "RPC budget"
+        "RPC budget (Multicall3 batched)"
     );
 
     let ctx = Ctx {
@@ -119,26 +137,108 @@ async fn run() -> Result<()> {
             .get_block_number()
             .await
             .context("eth_blockNumber failed")?;
-        info!(block = block_num, "dry-run-once: fetching quotes…");
+        info!(block = block_num, "dry-run-once: fetching quotes via Multicall3…");
         return process_block(&http, &ctx, block_num, true).await;
     }
 
-    // Continuous block loop.
+    // Continuous block loop with lag detection and watchdog.
     //
-    // Sampling uses the block number itself (`block % N == 0`) rather than a
-    // counter: a counter captured into the per-block `async move` future is
-    // copied, never incremented in the outer scope, and silently skips every
-    // block. Block-number sampling is stateless and survives reconnects.
+    // Processing of a sampled block must finish before the next sampled block starts.
+    // If block processing falls behind, the newly arriving sampled block is skipped
+    // and a warning is logged with the lag in blocks.
+    //
+    // Watchdog: If no sampled block is processed for `cfg.watchdog_secs`, log an ERROR
+    // and exit with code 1 so an external restart loop can restart the process.
+    // The watchdog timer arms once the WebSocket subscription is established.
     let log_every = cfg.log_every_n_blocks;
-    let ctx = &ctx;
-    let http_ref = &http;
-    provider::run_block_loop(&cfg.rpc_ws, &http, |_, block_num| async move {
-        if !block_num.is_multiple_of(log_every) {
-            return Ok(());
+    let ctx = std::sync::Arc::new(ctx);
+    let http = std::sync::Arc::new(http);
+    let active_block = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let watchdog = watchdog::Watchdog::new(std::time::Duration::from_secs(cfg.watchdog_secs));
+    let watchdog_sub = watchdog.clone();
+    let watchdog_block = watchdog.clone();
+    let watchdog_runner = watchdog.clone();
+
+    info!(
+        watchdog_secs = cfg.watchdog_secs,
+        "Watchdog configured (arms on WebSocket subscription)"
+    );
+
+    let active_block_clone = std::sync::Arc::clone(&active_block);
+    let ctx_clone = std::sync::Arc::clone(&ctx);
+    let http_clone = std::sync::Arc::clone(&http);
+
+    let block_loop = provider::run_block_loop(
+        &cfg.rpc_ws,
+        &http,
+        move || {
+            watchdog_sub.arm();
+        },
+        move |_, block_num| {
+            let active_block = std::sync::Arc::clone(&active_block_clone);
+            let ctx = std::sync::Arc::clone(&ctx_clone);
+            let http = std::sync::Arc::clone(&http_clone);
+            let watchdog_ref = watchdog_block.clone();
+            async move {
+                if !block_num.is_multiple_of(log_every) {
+                    return Ok(());
+                }
+                let active = active_block.load(std::sync::atomic::Ordering::SeqCst);
+                if active != 0 {
+                    let lag = block_num.saturating_sub(active);
+                    warn!(
+                        block = block_num,
+                        active_block = active,
+                        lag_blocks = lag,
+                        "Block processing fell behind active block — skipping sampled block"
+                    );
+                    return Ok(());
+                }
+                active_block.store(block_num, std::sync::atomic::Ordering::SeqCst);
+                let active_ref = std::sync::Arc::clone(&active_block);
+                tokio::spawn(async move {
+                    let res = process_block(&http, &ctx, block_num, false).await;
+                    active_ref.store(0, std::sync::atomic::Ordering::SeqCst);
+                    match res {
+                        Ok(()) => {
+                            watchdog_ref.notify_processed_block();
+                        }
+                        Err(e) => {
+                            warn!(
+                                block = block_num,
+                                error = %provider::redact_urls(&format!("{e:#}")),
+                                "Block processing error"
+                            );
+                        }
+                    }
+                });
+                Ok(())
+            }
+        },
+    );
+
+    tokio::select! {
+        res = block_loop => {
+            if let Err(e) = res {
+                error!(
+                    error = %provider::redact_urls(&format!("{e:#}")),
+                    "WebSocket block loop terminated with error"
+                );
+                std::process::exit(1);
+            }
+            Ok(())
         }
-        process_block(http_ref, ctx, block_num, false).await
-    })
-    .await
+        tripped = watchdog_runner.run() => {
+            error!(
+                timeout_secs = cfg.watchdog_secs,
+                elapsed_secs = tripped.elapsed.as_secs(),
+                "Watchdog tripped: no sampled block processed for {} seconds; exiting with non-zero code",
+                cfg.watchdog_secs
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 // ── Block processing ──────────────────────────────────────────────────────────
@@ -152,43 +252,48 @@ async fn process_block(
     let t0 = std::time::Instant::now();
     let block = BlockId::number(block_num);
 
-    // State reads, concurrently, pinned to `block`.
-    let (liq, reserves) = tokio::try_join!(
-        uniswap_v3::fetch_liquidity(http, &ctx.v3_pools, block),
-        sushi_v2::get_reserves(http, ctx.sushi_meta, block),
-    )?;
-    let state = MarketState {
+    // All per-block reads and quotes executed in 2 aggregate3 calls pinned to `block`.
+    let batched = strategy::process_block_batched(
+        http,
+        &ctx.v3_pools,
+        ctx.sushi_meta,
+        &ctx.trade_sizes,
         block,
-        v3: ctx.v3_pools.iter().cloned().zip(liq).collect(),
-        sushi: reserves,
-    };
+    )
+    .await?;
 
-    // Quotes for every venue pair, both directions, every size.
-    let (first, trips) = strategy::collect_round_trips(http, &state, &ctx.trade_sizes).await?;
-
-    let timestamp = std::time::SystemTime::now()
+    let logged_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let records = strategy::to_records(block_num, timestamp, &state, &trips);
+
+    let records = strategy::to_records(
+        block_num,
+        batched.block_timestamp,
+        logged_at,
+        &batched.state,
+        &batched.trips,
+    );
+
+    let rpc_calls = rpc_calls_per_block();
 
     info!(
         block = block_num,
-        rpc_calls = rpc_calls_per_block(ctx.v3_pools.len(), ctx.trade_sizes.len()),
+        rpc_calls = rpc_calls,
         records = records.len(),
         best_bps = records.first().map(|r| r.gross_spread_bps).unwrap_or(f64::NAN),
         elapsed_ms = t0.elapsed().as_millis(),
         "Block processed"
     );
 
-    append_jsonl(&ctx.output_file, &records)?;
+    strategy::append_jsonl(&ctx.output_file, &records)?;
 
     if dry_run {
-        print_prices(&state, &first);
-        print_sanity(&first);
+        print_prices(&batched.state, &batched.first);
+        print_sanity(&batched.first);
         // Cross-check local Sushi math against the deployed router (+1 RPC call).
         if let Some(&size) = ctx.trade_sizes.first() {
-            match sushi_v2::cross_check_router(http, &state.sushi, weth_to_raw(size), block).await {
+            match sushi_v2::cross_check_router(http, &batched.state.sushi, weth_to_raw(size), block).await {
                 Ok(c) => println!(
                     "Sushi CPF cross-check @ {} WETH: local={} router={} diff={}  {}",
                     raw_to_weth(c.amount_in),
@@ -218,11 +323,11 @@ async fn process_block(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// RPC calls per processed block (continuous mode):
-///   V3 `liquidity()` per pool + 1 Sushi `getReserves` + QuoterV2 calls.
+/// Batch 1 (state + first legs) + Batch 2 (second legs) = 2 Multicall3 aggregate3 calls.
 /// Block numbers arrive via the WS subscription (no extra call).
 /// `--dry-run-once` adds 1 `eth_blockNumber` + 1 router cross-check.
-fn rpc_calls_per_block(n_v3: usize, n_sizes: usize) -> usize {
-    n_v3 + 1 + strategy::quoter_calls(n_v3, n_sizes)
+fn rpc_calls_per_block() -> usize {
+    2
 }
 
 /// Per-venue price and depth table.
@@ -290,21 +395,3 @@ fn print_spreads(records: &[OpportunityRecord]) {
     println!("Dir: a_to_b = WETH->USDC on A, USDC->WETH on B; b_to_a = reverse.");
 }
 
-/// Append a slice of records to a JSONL file (one JSON object per line).
-fn append_jsonl(path: &str, records: &[OpportunityRecord]) -> Result<()> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("Cannot open output file: {path}"))?;
-
-    for record in records {
-        let line = serde_json::to_string(record)
-            .context("Failed to serialise opportunity record")?;
-        writeln!(file, "{line}").with_context(|| format!("Write failed: {path}"))?;
-    }
-    Ok(())
-}

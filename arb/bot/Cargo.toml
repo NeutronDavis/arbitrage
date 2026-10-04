@@ -3,10 +3,23 @@ name        = "arb-bot"
 version     = "0.1.0"
 edition     = "2021"
 description = "Arbitrum WETH/USDC flash-loan arbitrage bot"
+default-run = "arb-bot"
+
+[lib]
+name = "arb_bot"
+path = "src/lib.rs"
 
 [[bin]]
 name = "arb-bot"
 path = "src/main.rs"
+
+[[bin]]
+name = "summarize"
+path = "src/bin/summarize.rs"
+
+[[bin]]
+name = "verify_parity"
+path = "src/bin/verify_parity.rs"
 
 [dependencies]
 # Ethereum — alloy 2.4 (stable, successor to ethers-rs)

@@ -76,8 +76,9 @@ pub async fn get_pair_meta<P: Provider>(http: &P) -> Result<PairMeta> {
     Ok(PairMeta { weth_is_token0: token0 == weth_addr })
 }
 
-// ── Per-block reads ───────────────────────────────────────────────────────────
+// ── Per-block reads (legacy / comparison) ────────────────────────────────────
 
+#[allow(dead_code)]
 pub async fn get_reserves<P: Provider>(
     http: &P,
     meta: PairMeta,
@@ -155,6 +156,39 @@ pub async fn cross_check_router<P: Provider>(
         local_out: reserves.weth_to_usdc(weth_in),
         router_out,
     })
+}
+
+// ── Multicall3 helpers ────────────────────────────────────────────────────────
+
+use alloy::sol_types::SolCall;
+use crate::multicall::{Call3, MulticallResult};
+
+/// Build a Multicall3 call for `IUniswapV2Pair.getReserves()`.
+pub fn build_reserves_call() -> Result<Call3> {
+    let pair_addr: Address = SUSHI_V2_WETH_USDC_PAIR.parse()?;
+    let call_data = IUniswapV2Pair::getReservesCall {}.abi_encode();
+    Ok(Call3 {
+        target: pair_addr,
+        allowFailure: true,
+        callData: call_data.into(),
+    })
+}
+
+/// Decode the result of an `IUniswapV2Pair.getReserves()` call from Multicall3.
+pub fn decode_reserves_result(
+    res: &MulticallResult,
+    meta: PairMeta,
+) -> Option<Reserves> {
+    if !res.success {
+        return None;
+    }
+    let r = IUniswapV2Pair::getReservesCall::abi_decode_returns(&res.returnData).ok()?;
+    let (reserve_weth, reserve_usdc) = if meta.weth_is_token0 {
+        (r.reserve0.to::<u128>(), r.reserve1.to::<u128>())
+    } else {
+        (r.reserve1.to::<u128>(), r.reserve0.to::<u128>())
+    };
+    Some(Reserves { reserve_weth, reserve_usdc })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

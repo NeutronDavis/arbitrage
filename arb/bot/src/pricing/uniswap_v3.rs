@@ -54,7 +54,7 @@ sol! {
 sol! {
     #[sol(rpc)]
     interface IUniswapV3Pool {
-        function liquidity() external view returns (uint128);
+        function liquidity() external view returns (uint128 liquidity);
     }
 }
 
@@ -101,10 +101,11 @@ pub async fn discover_pools<P: Provider>(
     Ok(pools)
 }
 
-// ── Per-block reads ───────────────────────────────────────────────────────────
+// ── Per-block reads (legacy / comparison) ────────────────────────────────────
 
 /// Read in-range liquidity `L` for every pool, concurrently.
 /// Returned in the same order as `pools`.
+#[allow(dead_code)]
 pub async fn fetch_liquidity<P: Provider>(
     http: &P,
     pools: &[V3Pool],
@@ -125,6 +126,7 @@ pub async fn fetch_liquidity<P: Provider>(
 ///
 /// Returns `Ok(None)` when the quoter reverts (e.g. not enough liquidity for
 /// the size); the caller skips that combination rather than aborting the block.
+#[allow(dead_code)]
 pub async fn quote<P: Provider>(
     http: &P,
     block: BlockId,
@@ -160,4 +162,62 @@ pub async fn quote<P: Provider>(
             Ok(None)
         }
     }
+}
+
+// ── Multicall3 helpers ────────────────────────────────────────────────────────
+
+use alloy::sol_types::SolCall;
+use crate::multicall::{Call3, MulticallResult};
+
+/// Build a Multicall3 call for `IUniswapV3Pool.liquidity()`.
+pub fn build_liquidity_call(pool: Address) -> Call3 {
+    let call_data = IUniswapV3Pool::liquidityCall {}.abi_encode();
+    Call3 {
+        target: pool,
+        allowFailure: true,
+        callData: call_data.into(),
+    }
+}
+
+/// Decode the result of an `IUniswapV3Pool.liquidity()` call from Multicall3.
+pub fn decode_liquidity_result(res: &MulticallResult) -> Option<u128> {
+    if !res.success {
+        return None;
+    }
+    IUniswapV3Pool::liquidityCall::abi_decode_returns(&res.returnData)
+        .ok()
+}
+
+/// Build a Multicall3 call for `IQuoterV2.quoteExactInputSingle()`.
+pub fn build_quote_call(fee: u32, side: Side, amount_in: U256) -> Result<Call3> {
+    let quoter_addr: Address = UNI_V3_QUOTER_V2.parse()?;
+    let weth_addr: Address = WETH.parse()?;
+    let usdc_addr: Address = USDC.parse()?;
+    let (token_in, token_out) = match side {
+        Side::WethToUsdc => (weth_addr, usdc_addr),
+        Side::UsdcToWeth => (usdc_addr, weth_addr),
+    };
+    let params = IQuoterV2::QuoteExactInputSingleParams {
+        tokenIn: token_in,
+        tokenOut: token_out,
+        amountIn: amount_in,
+        fee: U24::from(fee),
+        sqrtPriceLimitX96: U160::ZERO,
+    };
+    let call_data = IQuoterV2::quoteExactInputSingleCall { params }.abi_encode();
+    Ok(Call3 {
+        target: quoter_addr,
+        allowFailure: true,
+        callData: call_data.into(),
+    })
+}
+
+/// Decode the result of an `IQuoterV2.quoteExactInputSingle()` call from Multicall3.
+pub fn decode_quote_result(res: &MulticallResult) -> Option<U256> {
+    if !res.success {
+        return None;
+    }
+    IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&res.returnData)
+        .ok()
+        .map(|r| r.amountOut)
 }

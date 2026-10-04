@@ -1,7 +1,7 @@
 //! Environment loading and validated configuration.
 //!
 //! Phase 2: fully wired. New optional variables with documented defaults:
-//!   LOG_EVERY_N_BLOCKS  — process every Nth block (default 4)
+//!   LOG_EVERY_N_BLOCKS  — process every Nth block (default 40)
 //!   TRADE_SIZES_WETH    — comma-separated WETH amounts to quote (default "0.01,0.05,0.1")
 //!   OUTPUT_FILE         — path for JSONL opportunity log (default "data/opportunities.jsonl")
 
@@ -29,6 +29,9 @@ pub struct Config {
     pub trade_sizes_weth: Vec<f64>,
     /// Path for the JSONL opportunity log file.
     pub output_file: String,
+    /// Watchdog timeout in seconds. If no sampled block is processed for this long,
+    /// the bot logs an ERROR and exits with a non-zero code. Default is 90 seconds.
+    pub watchdog_secs: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -41,6 +44,7 @@ impl std::fmt::Debug for Config {
             .field("log_every_n_blocks", &self.log_every_n_blocks)
             .field("trade_sizes_weth", &self.trade_sizes_weth)
             .field("output_file", &self.output_file)
+            .field("watchdog_secs", &self.watchdog_secs)
             .finish()
     }
 }
@@ -76,7 +80,7 @@ impl Config {
             .map_err(|e| anyhow!("MIN_PROFIT_WEI parse error: {e}"))?;
 
         let log_every_n_blocks: u64 = std::env::var("LOG_EVERY_N_BLOCKS")
-            .unwrap_or_else(|_| "4".into())
+            .unwrap_or_else(|_| "40".into())
             .trim()
             .parse()
             .context("LOG_EVERY_N_BLOCKS must be a positive integer")?;
@@ -102,6 +106,16 @@ impl Config {
         let output_file = std::env::var("OUTPUT_FILE")
             .unwrap_or_else(|_| "data/opportunities.jsonl".into());
 
+        let watchdog_secs: u64 = std::env::var("WATCHDOG_SECS")
+            .unwrap_or_else(|_| "90".into())
+            .trim()
+            .parse()
+            .context("WATCHDOG_SECS must be a positive integer")?;
+
+        if watchdog_secs == 0 {
+            return Err(anyhow!("WATCHDOG_SECS must be > 0"));
+        }
+
         Ok(Self {
             rpc_http,
             rpc_ws,
@@ -110,6 +124,7 @@ impl Config {
             log_every_n_blocks,
             trade_sizes_weth,
             output_file,
+            watchdog_secs,
         })
     }
 }

@@ -21,7 +21,7 @@
 use alloy::eips::BlockId;
 use alloy::primitives::U256;
 use alloy::providers::Provider;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 
@@ -30,6 +30,7 @@ use crate::pricing::uniswap_v3::{self, Side, V3Pool};
 use crate::pricing::weth_to_raw;
 
 /// Upper bound on in-flight quoter `eth_call`s, to stay under provider rate limits.
+#[allow(dead_code)]
 const MAX_CONCURRENT_RPC: usize = 8;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -54,6 +55,7 @@ impl std::fmt::Display for Venue {
 #[derive(Debug, Clone)]
 pub struct MarketState {
     /// Every read and quote for this block is pinned to this block.
+    #[allow(dead_code)]
     pub block: BlockId,
     /// Discovered V3 pools with their in-range liquidity `L` this block.
     pub v3: Vec<(V3Pool, u128)>,
@@ -109,10 +111,12 @@ pub struct RoundTrip {
 }
 
 /// One JSONL output record per (block, venue pair, direction, size).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct OpportunityRecord {
-    /// Local wall-clock unix seconds when the block was processed.
+    /// On-chain block timestamp (unix seconds).
     pub timestamp: u64,
+    /// Local wall-clock unix seconds when the block was processed and logged.
+    pub logged_at: u64,
     pub block_number: u64,
     /// The venue pair is unordered and canonical (V3 tiers ascending, then Sushi);
     /// `direction` says which way the WETH flowed.
@@ -124,18 +128,18 @@ pub struct OpportunityRecord {
     pub size_weth: f64,
     /// Raw WETH (18 dec) returned after both legs, as a string for precision.
     pub weth_out: String,
-    /// Raw USDC (6 dec) held between the two legs.
+    /// Raw USDC (6 dec) held between the two legs, as a string for precision.
     pub usdc_mid: String,
     /// Gross spread in basis points (may be negative).
     pub gross_spread_bps: f64,
-    /// Depth of venue_a in V3 `L` units (V2 pair: sqrt(reserve_weth·reserve_usdc)).
-    pub pool_liquidity_a: u128,
-    /// Depth of venue_b in V3 `L` units.
-    pub pool_liquidity_b: u128,
-    /// SushiSwap WETH reserve at read time (18 dec), logged on every record.
-    pub sushi_reserve_weth: u128,
-    /// SushiSwap USDC reserve at read time (6 dec), logged on every record.
-    pub sushi_reserve_usdc: u128,
+    /// Depth of venue_a in V3 `L` units, as a JSON string for precision.
+    pub pool_liquidity_a: String,
+    /// Depth of venue_b in V3 `L` units, as a JSON string for precision.
+    pub pool_liquidity_b: String,
+    /// SushiSwap WETH reserve at read time (18 dec), logged on every record as a JSON string.
+    pub sushi_reserve_weth: String,
+    /// SushiSwap USDC reserve at read time (6 dec), logged on every record as a JSON string.
+    pub sushi_reserve_usdc: String,
 }
 
 // ── Pure math ─────────────────────────────────────────────────────────────────
@@ -162,11 +166,178 @@ pub fn v2_liquidity(r: &Reserves) -> u128 {
         .unwrap_or(u128::MAX)
 }
 
-// ── Quoting (RPC) ─────────────────────────────────────────────────────────────
+// ── Batched Quoting via Multicall3 (Target: 2 RPC calls per block) ───────────
+
+/// Output of a batched per-block read (Batch 1 + Batch 2).
+pub struct BatchedBlockResult {
+    pub block_timestamp: u64,
+    pub state: MarketState,
+    pub first: Vec<FirstLeg>,
+    pub trips: Vec<RoundTrip>,
+}
+
+/// Process all per-block reads and quotes in exactly 2 Multicall3 `aggregate3` calls:
+/// - Batch 1: Timestamp + V3 pool liquidity + Sushi reserves + all V3 first leg quotes (WETH -> USDC).
+/// - Batch 2: All V3 second leg quotes (USDC -> WETH) using the exact mid amounts.
+///
+/// Sushi quotes are calculated locally via constant-product formula (0 RPC calls).
+pub async fn process_block_batched<P: Provider>(
+    http: &P,
+    v3_pools: &[V3Pool],
+    sushi_meta: crate::pricing::sushi_v2::PairMeta,
+    sizes_weth: &[f64],
+    block: BlockId,
+) -> Result<BatchedBlockResult> {
+    use crate::multicall;
+    use crate::pricing::uniswap_v3::Side;
+
+    // ── Batch 1: Timestamp + State Reads + First Legs ─────────────────────────
+    let mut batch1 = Vec::new();
+
+    // Call 0: Block timestamp
+    batch1.push(multicall::build_timestamp_call()?);
+
+    // Calls 1..=n_pools: UniV3 pool liquidity
+    for p in v3_pools {
+        batch1.push(uniswap_v3::build_liquidity_call(p.address));
+    }
+
+    // Call 1 + n_pools: Sushi getReserves()
+    batch1.push(crate::pricing::sushi_v2::build_reserves_call()?);
+
+    // Calls for first leg UniV3 quotes: (pool, size)
+    for p in v3_pools {
+        for &size in sizes_weth {
+            let weth_in = U256::from(weth_to_raw(size));
+            batch1.push(uniswap_v3::build_quote_call(p.fee, Side::WethToUsdc, weth_in)?);
+        }
+    }
+
+    // Execute Batch 1 (RPC Call 1)
+    let res1 = multicall::aggregate3(http, batch1, block).await?;
+
+    let block_timestamp = multicall::decode_timestamp_result(&res1[0]).unwrap_or(0);
+
+    let n_pools = v3_pools.len();
+    let mut v3_liq = Vec::with_capacity(n_pools);
+    for (i, p) in v3_pools.iter().enumerate() {
+        let liq = uniswap_v3::decode_liquidity_result(&res1[1 + i]).unwrap_or(0);
+        v3_liq.push((p.clone(), liq));
+    }
+
+    let sushi_reserves = crate::pricing::sushi_v2::decode_reserves_result(&res1[1 + n_pools], sushi_meta)
+        .unwrap_or(Reserves { reserve_weth: 0, reserve_usdc: 0 });
+
+    let state = MarketState {
+        block,
+        v3: v3_liq,
+        sushi: sushi_reserves,
+    };
+
+    // Unpack first legs
+    let mut first = Vec::new();
+
+    // 1. UniV3 first legs from Batch 1
+    let mut quote_idx = 2 + n_pools;
+    for p in v3_pools {
+        for &size in sizes_weth {
+            let weth_in = weth_to_raw(size);
+            if let Some(usdc_out) = uniswap_v3::decode_quote_result(&res1[quote_idx]) {
+                first.push(FirstLeg {
+                    venue: Venue::UniswapV3 { fee: p.fee },
+                    size_weth: size,
+                    weth_in,
+                    usdc_out: usdc_out.to::<u128>(),
+                });
+            }
+            quote_idx += 1;
+        }
+    }
+
+    // 2. Sushi first legs (calculated locally off reserves, 0 RPC calls)
+    for &size in sizes_weth {
+        let weth_in = weth_to_raw(size);
+        let usdc_out = state.sushi.weth_to_usdc(weth_in);
+        if usdc_out > 0 {
+            first.push(FirstLeg {
+                venue: Venue::SushiV2,
+                size_weth: size,
+                weth_in,
+                usdc_out,
+            });
+        }
+    }
+
+    // ── Batch 2: Second Legs ──────────────────────────────────────────────────
+    let venues = state.venues();
+    let mut batch2 = Vec::new();
+    let mut batch2_meta = Vec::new();
+    let mut trips = Vec::new();
+
+    for leg in &first {
+        for &venue_b in &venues {
+            if venue_b == leg.venue {
+                continue;
+            }
+            match venue_b {
+                Venue::SushiV2 => {
+                    // Local Sushi calculation (0 RPC calls)
+                    let weth_back = state.sushi.usdc_to_weth(leg.usdc_out);
+                    if weth_back > 0 {
+                        trips.push(RoundTrip {
+                            venue_a: leg.venue,
+                            venue_b,
+                            size_weth: leg.size_weth,
+                            weth_in: leg.weth_in,
+                            usdc_mid: leg.usdc_out,
+                            weth_back,
+                        });
+                    }
+                }
+                Venue::UniswapV3 { fee } => {
+                    let call = uniswap_v3::build_quote_call(
+                        fee,
+                        Side::UsdcToWeth,
+                        U256::from(leg.usdc_out),
+                    )?;
+                    batch2.push(call);
+                    batch2_meta.push((*leg, venue_b));
+                }
+            }
+        }
+    }
+
+    if !batch2.is_empty() {
+        // Execute Batch 2 (RPC Call 2)
+        let res2 = multicall::aggregate3(http, batch2, block).await?;
+        for (res, (leg, venue_b)) in res2.iter().zip(batch2_meta) {
+            if let Some(weth_back) = uniswap_v3::decode_quote_result(res) {
+                trips.push(RoundTrip {
+                    venue_a: leg.venue,
+                    venue_b,
+                    size_weth: leg.size_weth,
+                    weth_in: leg.weth_in,
+                    usdc_mid: leg.usdc_out,
+                    weth_back: weth_back.to::<u128>(),
+                });
+            }
+        }
+    }
+
+    Ok(BatchedBlockResult {
+        block_timestamp,
+        state,
+        first,
+        trips,
+    })
+}
+
+// ── Legacy Quoting (fallback / comparison) ───────────────────────────────────
 
 /// Quote `amount_in` on `venue` for the given side. Sushi is local (0 RPC calls);
 /// V3 is one QuoterV2 call. `None` = quote unavailable (quoter reverted).
-async fn quote_on<P: Provider>(
+#[allow(dead_code)]
+pub async fn quote_on<P: Provider>(
     http: &P,
     state: &MarketState,
     venue: Venue,
@@ -185,13 +356,15 @@ async fn quote_on<P: Provider>(
 }
 
 /// Number of RPC calls `collect_round_trips` makes (QuoterV2 calls only).
+#[allow(dead_code)]
 pub fn quoter_calls(n_v3: usize, n_sizes: usize) -> usize {
     // First legs: one per V3 venue per size.
     // Second legs: V3 venue B, for each other venue A (n_v3 - 1 V3 + 1 Sushi), per size.
     n_v3 * n_sizes + n_v3 * n_v3 * n_sizes
 }
 
-/// Price every first leg and every cross-venue round trip for one block.
+/// Price every first leg and every cross-venue round trip for one block (unbatched).
+#[allow(dead_code)]
 pub async fn collect_round_trips<P: Provider>(
     http: &P,
     state: &MarketState,
@@ -251,6 +424,7 @@ pub async fn collect_round_trips<P: Provider>(
 pub fn to_records(
     block_number: u64,
     timestamp: u64,
+    logged_at: u64,
     state: &MarketState,
     trips: &[RoundTrip],
 ) -> Vec<OpportunityRecord> {
@@ -268,6 +442,7 @@ pub fn to_records(
             };
             OpportunityRecord {
                 timestamp,
+                logged_at,
                 block_number,
                 venue_a: a.to_string(),
                 venue_b: b.to_string(),
@@ -276,10 +451,10 @@ pub fn to_records(
                 weth_out: t.weth_back.to_string(),
                 usdc_mid: t.usdc_mid.to_string(),
                 gross_spread_bps: gross_spread_bps(t.weth_in, t.weth_back),
-                pool_liquidity_a: state.liquidity(a),
-                pool_liquidity_b: state.liquidity(b),
-                sushi_reserve_weth: state.sushi.reserve_weth,
-                sushi_reserve_usdc: state.sushi.reserve_usdc,
+                pool_liquidity_a: state.liquidity(a).to_string(),
+                pool_liquidity_b: state.liquidity(b).to_string(),
+                sushi_reserve_weth: state.sushi.reserve_weth.to_string(),
+                sushi_reserve_usdc: state.sushi.reserve_usdc.to_string(),
             }
         })
         .collect();
@@ -290,6 +465,29 @@ pub fn to_records(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     records
+}
+
+/// Append a slice of records to a JSONL file (one JSON object per line).
+///
+/// Opens the file with `create(true)` and `append(true)` so the file is created
+/// if missing, and appended to without truncation if it already exists.
+pub fn append_jsonl(path: &str, records: &[OpportunityRecord]) -> Result<()> {
+    use std::io::Write;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Cannot open output file: {path}"))?;
+
+    for record in records {
+        let line = serde_json::to_string(record)
+            .context("Failed to serialise opportunity record")?;
+        writeln!(file, "{line}").with_context(|| format!("Write failed: {path}"))?;
+    }
+    Ok(())
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -372,18 +570,81 @@ mod tests {
             // V3 -> Sushi : -100 bps
             RoundTrip { venue_a: v3, venue_b: Venue::SushiV2, size_weth: 0.01, weth_in: w, usdc_mid: 1, weth_back: w - w / 100 },
         ];
-        let recs = to_records(1, 2, &state, &trips);
+        let recs = to_records(1, 2, 3, &state, &trips);
         assert_eq!(recs.len(), 2);
         // Sorted best first.
         assert!(recs[0].gross_spread_bps > recs[1].gross_spread_bps);
         // Both records use the same canonical pair.
         for r in &recs {
+            assert_eq!(r.timestamp, 2);
+            assert_eq!(r.logged_at, 3);
             assert_eq!(r.venue_a, "UniV3-500");
             assert_eq!(r.venue_b, "SushiV2");
-            assert_eq!(r.pool_liquidity_a, 42);
-            assert_eq!(r.pool_liquidity_b, 6 * 10u128.pow(12));
+            assert_eq!(r.pool_liquidity_a, "42");
+            assert_eq!(r.pool_liquidity_b, (6 * 10u128.pow(12)).to_string());
+            assert_eq!(r.sushi_reserve_weth, (4 * 10u128.pow(18)).to_string());
+            assert_eq!(r.sushi_reserve_usdc, (9 * 10u128.pow(6)).to_string());
         }
         assert_eq!(recs[0].direction, "b_to_a");
         assert_eq!(recs[1].direction, "a_to_b");
     }
+
+    #[test]
+    fn test_reopening_output_file_appends() {
+        let dummy = |block: u64| OpportunityRecord {
+            timestamp: 1000 + block,
+            logged_at: 1001 + block,
+            block_number: block,
+            venue_a: "UniV3-500".into(),
+            venue_b: "SushiV2".into(),
+            direction: "a_to_b".into(),
+            size_weth: 0.01,
+            weth_out: "9966649150947404".into(),
+            usdc_mid: "26912378".into(),
+            gross_spread_bps: -33.5,
+            pool_liquidity_a: "1000".into(),
+            pool_liquidity_b: "2000".into(),
+            sushi_reserve_weth: "3000".into(),
+            sushi_reserve_usdc: "4000".into(),
+        };
+
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!(
+            "arb_test_append_{}.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = test_file.to_str().unwrap();
+
+        // Ensure file does not exist initially
+        let _ = std::fs::remove_file(&test_file);
+
+        // First write: batch of 2 records (creates file)
+        let batch1 = vec![dummy(100), dummy(101)];
+        append_jsonl(path_str, &batch1).expect("first append must succeed");
+
+        let content1 = std::fs::read_to_string(&test_file).expect("must read file after first write");
+        let lines1: Vec<&str> = content1.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines1.len(), 2, "initial write must create file with 2 records");
+
+        // Reopen / second write (simulating subsequent block or process restart)
+        let batch2 = vec![dummy(102), dummy(103), dummy(104)];
+        append_jsonl(path_str, &batch2).expect("second append must succeed");
+
+        let content2 = std::fs::read_to_string(&test_file).expect("must read file after second write");
+        let lines2: Vec<&str> = content2.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines2.len(), 5, "reopening must append all 3 new records without truncating first 2");
+
+        // Verify content order preserved
+        let parsed_first: OpportunityRecord = serde_json::from_str(lines2[0]).unwrap();
+        let parsed_last: OpportunityRecord = serde_json::from_str(lines2[4]).unwrap();
+        assert_eq!(parsed_first.block_number, 100);
+        assert_eq!(parsed_last.block_number, 104);
+
+        // Clean up
+        let _ = std::fs::remove_file(&test_file);
+    }
 }
+
