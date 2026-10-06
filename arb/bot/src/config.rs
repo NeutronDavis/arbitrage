@@ -7,8 +7,27 @@
 //!   OUTPUT_FILE         — path for JSONL opportunity log (default "data/opportunities.jsonl")
 //!   WATCHDOG_SECS       — watchdog timeout in seconds (default 90)
 
+use alloy::primitives::Address;
 use anyhow::{anyhow, Context, Result};
+use crate::constants::{USDC, USDT, WBTC};
 use crate::strategy::Venue;
+
+/// Configuration for a specific WETH/token market.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketConfig {
+    /// Token symbol, e.g. "USDC", "WBTC", "USDT".
+    pub symbol: String,
+    /// Canonical pair label, e.g. "WETH/USDC", "WETH/WBTC", "WETH/USDT".
+    pub pair: String,
+    /// Token contract address.
+    pub quote_token: Address,
+    /// Token decimals (e.g. 6 for USDC/USDT, 8 for WBTC).
+    pub quote_decimals: u8,
+    /// Active venues to quote and log for this market.
+    pub venues: Vec<Venue>,
+    /// WETH amounts to quote for this market.
+    pub trade_sizes_weth: Vec<f64>,
+}
 
 /// All runtime configuration loaded from environment variables.
 ///
@@ -28,10 +47,8 @@ pub struct Config {
     pub min_profit_wei: u128,
     /// Process every Nth block. Reduces RPC usage at the cost of latency.
     pub log_every_n_blocks: u64,
-    /// Active venues to quote and log.
-    pub venues: Vec<Venue>,
-    /// WETH amounts (in whole WETH, as f64) to quote per venue per block.
-    pub trade_sizes_weth: Vec<f64>,
+    /// Active markets configured for logging.
+    pub markets: Vec<MarketConfig>,
     /// Path for the JSONL opportunity log file.
     pub output_file: String,
     /// Watchdog timeout in seconds. If no sampled block is processed for this long,
@@ -47,8 +64,7 @@ impl std::fmt::Debug for Config {
             .field("execution_enabled", &self.execution_enabled)
             .field("min_profit_wei", &self.min_profit_wei)
             .field("log_every_n_blocks", &self.log_every_n_blocks)
-            .field("venues", &self.venues)
-            .field("trade_sizes_weth", &self.trade_sizes_weth)
+            .field("markets", &self.markets)
             .field("output_file", &self.output_file)
             .field("watchdog_secs", &self.watchdog_secs)
             .finish()
@@ -95,30 +111,91 @@ impl Config {
             return Err(anyhow!("LOG_EVERY_N_BLOCKS must be > 0"));
         }
 
-        let venues_str = std::env::var("VENUES")
-            .unwrap_or_else(|_| "UniV3-500,UniV3-3000,Pancake-100,Pancake-500".into());
+        // Optional VENUES and TRADE_SIZES_WETH overrides for WETH/USDC (backwards compatibility)
+        let custom_usdc_venues: Option<Vec<Venue>> = match std::env::var("VENUES") {
+            Ok(s) if !s.trim().is_empty() => {
+                let v = s
+                    .split(',')
+                    .map(|x| x.trim().parse::<Venue>())
+                    .collect::<Result<Vec<_>>>()?;
+                Some(v)
+            }
+            _ => None,
+        };
 
-        let venues: Vec<Venue> = venues_str
-            .split(',')
-            .map(|s| s.trim().parse::<Venue>())
-            .collect::<Result<Vec<_>>>()?;
+        let custom_usdc_sizes: Option<Vec<f64>> = match std::env::var("TRADE_SIZES_WETH") {
+            Ok(s) if !s.trim().is_empty() => {
+                let sz = s
+                    .split(',')
+                    .map(|x| x.trim().parse::<f64>().context("TRADE_SIZES_WETH parse error"))
+                    .collect::<Result<Vec<_>>>()?;
+                Some(sz)
+            }
+            _ => None,
+        };
 
-        if venues.is_empty() {
-            return Err(anyhow!("VENUES cannot be empty"));
+        // Active markets (default: "USDC,WBTC,USDT")
+        let markets_str = std::env::var("MARKETS")
+            .unwrap_or_else(|_| "USDC,WBTC,USDT".into());
+
+        let mut markets = Vec::new();
+        for m_sym in markets_str.split(',') {
+            let sym = m_sym.trim().to_ascii_uppercase();
+            if sym.is_empty() {
+                continue;
+            }
+            match sym.as_str() {
+                "USDC" => {
+                    let venues = custom_usdc_venues.clone().unwrap_or_else(|| vec![
+                        Venue::UniswapV3 { fee: 500 },
+                        Venue::PancakeV3 { fee: 100 },
+                        Venue::PancakeV3 { fee: 500 },
+                    ]);
+                    let trade_sizes_weth = custom_usdc_sizes.clone().unwrap_or_else(|| vec![0.05, 0.1, 0.25, 0.5]);
+                    markets.push(MarketConfig {
+                        symbol: "USDC".into(),
+                        pair: "WETH/USDC".into(),
+                        quote_token: USDC.parse()?,
+                        quote_decimals: 6,
+                        venues,
+                        trade_sizes_weth,
+                    });
+                }
+                "WBTC" => {
+                    markets.push(MarketConfig {
+                        symbol: "WBTC".into(),
+                        pair: "WETH/WBTC".into(),
+                        quote_token: WBTC.parse()?,
+                        quote_decimals: 8,
+                        venues: vec![
+                            Venue::UniswapV3 { fee: 500 },
+                            Venue::PancakeV3 { fee: 100 },
+                        ],
+                        trade_sizes_weth: vec![0.1, 0.5, 1.0, 2.0],
+                    });
+                }
+                "USDT" => {
+                    markets.push(MarketConfig {
+                        symbol: "USDT".into(),
+                        pair: "WETH/USDT".into(),
+                        quote_token: USDT.parse()?,
+                        quote_decimals: 6,
+                        venues: vec![
+                            Venue::UniswapV3 { fee: 500 },
+                            Venue::PancakeV3 { fee: 100 },
+                            Venue::PancakeV3 { fee: 500 },
+                        ],
+                        trade_sizes_weth: vec![0.05, 0.1, 0.25],
+                    });
+                }
+                other => {
+                    anyhow::bail!("Unsupported market '{other}'. Supported markets are USDC, WBTC, USDT");
+                }
+            }
         }
 
-        let trade_sizes_weth: Vec<f64> = std::env::var("TRADE_SIZES_WETH")
-            .unwrap_or_else(|_| "0.05,0.1,0.25,0.5".into())
-            .split(',')
-            .map(|s| {
-                s.trim()
-                    .parse::<f64>()
-                    .context("TRADE_SIZES_WETH must be comma-separated floats, e.g. 0.05,0.1,0.25,0.5")
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        if trade_sizes_weth.is_empty() || trade_sizes_weth.iter().any(|&v| v <= 0.0) {
-            return Err(anyhow!("TRADE_SIZES_WETH values must be positive"));
+        if markets.is_empty() {
+            return Err(anyhow!("MARKETS cannot be empty"));
         }
 
         let output_file = std::env::var("OUTPUT_FILE")
@@ -140,8 +217,7 @@ impl Config {
             execution_enabled,
             min_profit_wei,
             log_every_n_blocks,
-            venues,
-            trade_sizes_weth,
+            markets,
             output_file,
             watchdog_secs,
         })
@@ -165,5 +241,13 @@ mod tests {
                 Venue::PancakeV3 { fee: 500 },
             ]
         );
+    }
+
+    #[test]
+    fn test_market_config_defaults() {
+        let wbtc_addr = WBTC.parse::<Address>().unwrap();
+        let usdt_addr = USDT.parse::<Address>().unwrap();
+        assert_ne!(wbtc_addr, Address::ZERO);
+        assert_ne!(usdt_addr, Address::ZERO);
     }
 }

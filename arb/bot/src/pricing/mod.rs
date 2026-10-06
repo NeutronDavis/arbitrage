@@ -11,16 +11,26 @@ pub fn weth_to_raw(amount: f64) -> u128 {
 }
 
 /// Raw 18-decimal WETH -> whole WETH.
+#[allow(dead_code)]
 pub fn raw_to_weth(raw: u128) -> f64 {
     raw as f64 / 1e18
 }
 
 /// USD per ETH implied by swapping `weth_in_raw` (18 dec) for `usdc_out_raw` (6 dec).
+#[allow(dead_code)]
 pub fn usd_per_eth(weth_in_raw: u128, usdc_out_raw: u128) -> f64 {
     if weth_in_raw == 0 {
         return 0.0;
     }
     (usdc_out_raw as f64 / 1e6) / (weth_in_raw as f64 / 1e18)
+}
+
+/// Implied rate of quote tokens per 1 WETH given raw inputs and decimals.
+pub fn implied_quote_per_weth(weth_in_raw: u128, quote_out_raw: u128, quote_decimals: u8) -> f64 {
+    if weth_in_raw == 0 {
+        return 0.0;
+    }
+    (quote_out_raw as f64 / 10f64.powi(quote_decimals as i32)) / (weth_in_raw as f64 / 1e18)
 }
 
 #[cfg(test)]

@@ -55,6 +55,7 @@ impl Reserves {
 }
 
 /// Result of comparing the local CPF quote with `router.getAmountsOut`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct CrossCheck {
     pub amount_in: u128,
@@ -129,6 +130,7 @@ pub fn cpf_amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u
 /// (WETH -> USDC). Dry-run only: costs one extra RPC call.
 ///
 /// Pinned to the same block as `reserves`, so the two must match exactly.
+#[allow(dead_code)]
 pub async fn cross_check_router<P: Provider>(
     http: &P,
     reserves: &Reserves,

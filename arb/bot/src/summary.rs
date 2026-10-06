@@ -5,9 +5,10 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::BufRead;
 
-/// Summary statistics for a single (venue_a, venue_b, direction, size) group.
+/// Summary statistics for a single (pair, venue_a, venue_b, direction, size) group.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupStats {
+    pub pair: String,
     pub venue_a: String,
     pub venue_b: String,
     pub direction: String,
@@ -19,8 +20,14 @@ pub struct GroupStats {
     pub p95_bps: f64,
 }
 
+fn default_pair() -> String {
+    "WETH/USDC".to_string()
+}
+
 #[derive(Deserialize)]
 struct OpportunityEntry {
+    #[serde(default = "default_pair")]
+    pub pair: String,
     pub venue_a: String,
     pub venue_b: String,
     pub direction: String,
@@ -55,12 +62,12 @@ pub fn percentile_95(sorted: &[f64]) -> f64 {
     sorted[rank.min(n - 1)]
 }
 
-type GroupKey = (String, String, String, u64);
+type GroupKey = (String, String, String, String, u64); // (pair, venue_a, venue_b, direction, size_key)
 type GroupVal = (f64, Vec<f64>);
 
 /// Summarise records from any reader yielding JSONL lines.
 pub fn summarize_reader<R: BufRead>(reader: R) -> Result<Vec<GroupStats>> {
-    // Key: (venue_a, venue_b, direction, size_key_nanoweth)
+    // Key: (pair, venue_a, venue_b, direction, size_key_nanoweth)
     let mut groups: BTreeMap<GroupKey, GroupVal> = BTreeMap::new();
 
     for (line_idx, line_res) in reader.lines().enumerate() {
@@ -74,13 +81,13 @@ pub fn summarize_reader<R: BufRead>(reader: R) -> Result<Vec<GroupStats>> {
 
         let size_key = (rec.size_weth * 1e9).round() as u64;
         let entry = groups
-            .entry((rec.venue_a, rec.venue_b, rec.direction, size_key))
+            .entry((rec.pair, rec.venue_a, rec.venue_b, rec.direction, size_key))
             .or_insert_with(|| (rec.size_weth, Vec::new()));
         entry.1.push(rec.gross_spread_bps);
     }
 
     let mut out = Vec::new();
-    for ((venue_a, venue_b, direction, _), (size_weth, mut spreads)) in groups {
+    for ((pair, venue_a, venue_b, direction, _), (size_weth, mut spreads)) in groups {
         spreads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let row_count = spreads.len();
         let positive_count = spreads.iter().filter(|&&s| s > 0.0).count();
@@ -89,6 +96,7 @@ pub fn summarize_reader<R: BufRead>(reader: R) -> Result<Vec<GroupStats>> {
         let p95_bps = percentile_95(&spreads);
 
         out.push(GroupStats {
+            pair,
             venue_a,
             venue_b,
             direction,
@@ -106,12 +114,12 @@ pub fn summarize_reader<R: BufRead>(reader: R) -> Result<Vec<GroupStats>> {
 
 /// Print formatted table of summary statistics.
 pub fn print_summary(stats: &[GroupStats]) {
-    println!("\n══ Opportunity Summary by Venue Pair, Direction & Size ══");
+    println!("\n══ Opportunity Summary by Pair, Venue Pair, Direction & Size ══");
     println!(
-        "{:<12} {:<12} {:<8} {:>8} {:>8} {:>14} {:>12} {:>12} {:>12}",
-        "Venue A", "Venue B", "Dir", "Size(W)", "Rows", "Spread > 0", "Max(bps)", "Median(bps)", "P95(bps)"
+        "{:<11} {:<12} {:<12} {:<8} {:>8} {:>8} {:>14} {:>12} {:>12} {:>12}",
+        "Pair", "Venue A", "Venue B", "Dir", "Size(W)", "Rows", "Spread > 0", "Max(bps)", "Median(bps)", "P95(bps)"
     );
-    println!("{:-<94}", "");
+    println!("{:-<106}", "");
 
     let mut total_rows = 0;
     let mut total_positive = 0;
@@ -126,7 +134,8 @@ pub fn print_summary(stats: &[GroupStats]) {
         };
         let pos_str = format!("{} ({:>5.1}%)", s.positive_count, pct_pos);
         println!(
-            "{:<12} {:<12} {:<8} {:>8.3} {:>8} {:>14} {:>12.2} {:>12.2} {:>12.2}",
+            "{:<11} {:<12} {:<12} {:<8} {:>8.3} {:>8} {:>14} {:>12.2} {:>12.2} {:>12.2}",
+            s.pair,
             s.venue_a,
             s.venue_b,
             s.direction,
@@ -138,7 +147,7 @@ pub fn print_summary(stats: &[GroupStats]) {
             s.p95_bps
         );
     }
-    println!("{:-<94}", "");
+    println!("{:-<106}", "");
     println!(
         "Total rows: {}, Groups: {}, Rows with spread > 0: {}\n",
         total_rows,
@@ -191,8 +200,9 @@ mod tests {
         let stats = summarize_reader(Cursor::new(fixture)).expect("summarize fixture");
         assert_eq!(stats.len(), 2);
 
-        // Group 1: UniV3-500 <-> SushiV2, a_to_b, 0.01 WETH
+        // Group 1: UniV3-500 <-> SushiV2, a_to_b, 0.01 WETH (defaults to WETH/USDC)
         let g1 = &stats[0];
+        assert_eq!(g1.pair, "WETH/USDC");
         assert_eq!(g1.venue_a, "UniV3-500");
         assert_eq!(g1.venue_b, "SushiV2");
         assert_eq!(g1.direction, "a_to_b");
@@ -205,8 +215,9 @@ mod tests {
         // p95 of 4 elements: ceil(0.95 * 4) - 1 = 4 - 1 = 3 -> 12.0
         assert_eq!(g1.p95_bps, 12.0);
 
-        // Group 2: UniV3-500 <-> SushiV2, b_to_a, 0.05 WETH
+        // Group 2: UniV3-500 <-> SushiV2, b_to_a, 0.05 WETH (defaults to WETH/USDC)
         let g2 = &stats[1];
+        assert_eq!(g2.pair, "WETH/USDC");
         assert_eq!(g2.direction, "b_to_a");
         assert_eq!(g2.size_weth, 0.05);
         assert_eq!(g2.row_count, 1);
@@ -214,5 +225,25 @@ mod tests {
         assert_eq!(g2.max_bps, -50.0);
         assert_eq!(g2.median_bps, -50.0);
         assert_eq!(g2.p95_bps, -50.0);
+    }
+
+    #[test]
+    fn test_summarize_multi_pair_and_legacy_rows() {
+        // Line 1: legacy row without pair (should default to WETH/USDC)
+        // Line 2: modern row with WETH/WBTC
+        // Line 3: modern row with WETH/USDT
+        let fixture = r#"
+{"venue_a":"UniV3-500","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.05,"gross_spread_bps":-12.0}
+{"pair":"WETH/WBTC","venue_a":"UniV3-500","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.1,"gross_spread_bps":-2.5}
+{"pair":"WETH/USDT","venue_a":"UniV3-500","venue_b":"Pancake-500","direction":"b_to_a","size_weth":0.05,"gross_spread_bps":-8.0}
+"#;
+        let stats = summarize_reader(Cursor::new(fixture)).expect("summarize multi pair");
+        assert_eq!(stats.len(), 3);
+
+        // Verify all 3 pairs were parsed and grouped
+        let pairs: Vec<&str> = stats.iter().map(|s| s.pair.as_str()).collect();
+        assert!(pairs.contains(&"WETH/USDC"));
+        assert!(pairs.contains(&"WETH/WBTC"));
+        assert!(pairs.contains(&"WETH/USDT"));
     }
 }

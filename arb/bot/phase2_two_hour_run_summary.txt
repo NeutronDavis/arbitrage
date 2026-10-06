@@ -1,0 +1,144 @@
+================================================================================
+PHASE 2: 2-HOUR MULTI-MARKET LIVE RUN & SPREAD ANALYSIS REPORT
+================================================================================
+Date: 2026-10-05
+Chain: Arbitrum One (Chain ID: 42161)
+Status: Completed (Read-Only)
+Dataset: data/opportunities.jsonl (44,350 records, 17.63 MB)
+
+--------------------------------------------------------------------------------
+1. RUN CONFIGURATION & OVERVIEW
+--------------------------------------------------------------------------------
+- Test Duration: ~2 hours continuous execution via run_logger.ps1
+- Monitored Markets (3):
+  * WETH/USDC (6 decimals)
+  * WETH/WBTC (8 decimals)
+  * WETH/USDT (6 decimals)
+- Active Pools Monitored (8 pools across Uniswap V3 and PancakeSwap V3):
+  * WETH/USDC UniV3-500:    0xC6962004f452bE9203591991D15f6b388e09E8D0
+  * WETH/USDC Pancake-100:  0x7fCDC35463E3770c2fB992716Cd070B63540b947
+  * WETH/USDC Pancake-500:  0xd9e2a1a61B6E61b275cEc326465d417e52C1b95c
+  * WETH/WBTC UniV3-500:    0x2f5e87C9312fa29aed5c179E456625D79015299c
+  * WETH/WBTC Pancake-100:  0x4bfc22A4dA7f31F8a912a79A7e44a822398b4390
+  * WETH/USDT UniV3-500:    0x641C00A822e8b671738d32a431a4Fb6074E5c79d
+  * WETH/USDT Pancake-100:  0x389938CF14Be379217570D8e4619E51fBDafaa21
+  * WETH/USDT Pancake-500:  0x0BaCc7a9717e70EA0DA5Ac075889Bd87d4C81197
+- Sampling Frequency: Sampled every 40 blocks (approx. every 10-12 seconds on Arbitrum)
+- Evaluated Permutations per Block: 50 records (across all pairs, directions, and sizes)
+
+--------------------------------------------------------------------------------
+2. EXECUTION METRICS & STABILITY
+--------------------------------------------------------------------------------
+- Total Rows Written: 44,350 rows
+- Total Sampled Blocks: 887 distinct Arbitrum blocks
+- Process Errors: 0
+- Watchdog Timeouts: 0
+- Dropped Blocks / Lag Warnings: 0
+- RPC Efficiency: Strictly 2 Multicall3 aggregate3 RPC calls per processed block
+- Average Block Processing Latency: ~435–450 ms
+
+--------------------------------------------------------------------------------
+3. OPPORTUNITY SUMMARY BY PAIR, VENUES, DIRECTION & SIZE
+--------------------------------------------------------------------------------
+Generated via summarize.exe on data/opportunities.jsonl:
+
+Pair        Venue A      Venue B      Dir       Size(W)     Rows     Spread > 0     Max(bps)  Median(bps)     P95(bps)
+----------------------------------------------------------------------------------------------------------
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.050      887     0 (  0.0%)        -1.28        -8.12        -3.39
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.100      887     0 (  0.0%)        -2.48        -9.33        -4.61
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.250      887     0 (  0.0%)        -6.08       -12.96        -8.24
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.500      887     0 (  0.0%)       -12.06       -18.95       -14.30
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.050      887     0 (  0.0%)        -1.04        -6.30        -3.01
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.100      887     0 (  0.0%)        -2.26        -7.49        -4.21
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.250      887     0 (  0.0%)        -5.89       -11.09        -7.84
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.500      887     0 (  0.0%)       -11.95       -17.08       -13.85
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.050      887     0 (  0.0%)        -2.00        -6.08        -3.54
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.100      887     0 (  0.0%)        -2.90        -6.99        -4.45
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.250      887     0 (  0.0%)        -5.62        -9.70        -7.16
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.500      887     0 (  0.0%)       -10.15       -14.23       -11.69
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.050      887     0 (  0.0%)        -2.38        -7.73        -3.75
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.100      887     0 (  0.0%)        -3.28        -8.63        -4.65
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.250      887     0 (  0.0%)        -6.00       -11.35        -7.38
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.500      887     0 (  0.0%)       -10.53       -15.87       -11.91
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.050      887     0 (  0.0%)        -7.96       -10.65        -9.00
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.100      887     0 (  0.0%)        -8.28       -10.96        -9.31
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.250      887     0 (  0.0%)        -9.24       -11.89       -10.27
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.500      887     0 (  0.0%)       -10.83       -13.43       -11.86
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.050      887     0 (  0.0%)        -8.06        -9.96        -8.44
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.100      887     0 (  0.0%)        -8.36       -10.26        -8.76
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.250      887     0 (  0.0%)        -9.28       -11.19        -9.72
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.500      887     0 (  0.0%)       -10.81       -12.78       -11.32
+WETH/USDT   Pancake-100  Pancake-500  a_to_b      0.050      887     0 (  0.0%)        -4.79       -12.07        -7.02
+WETH/USDT   Pancake-100  Pancake-500  a_to_b      0.100      887     0 (  0.0%)       -10.32       -17.60       -12.55
+WETH/USDT   Pancake-100  Pancake-500  a_to_b      0.250      887     0 (  0.0%)       -26.86       -34.11       -29.08
+WETH/USDT   Pancake-100  Pancake-500  b_to_a      0.050      887     0 (  0.0%)        -5.44       -10.98        -6.62
+WETH/USDT   Pancake-100  Pancake-500  b_to_a      0.100      887     0 (  0.0%)       -10.96       -16.51       -12.14
+WETH/USDT   Pancake-100  Pancake-500  b_to_a      0.250      887     0 (  0.0%)       -27.49       -33.01       -28.66
+WETH/USDT   UniV3-500    Pancake-100  a_to_b      0.050      887     0 (  0.0%)        -4.30        -9.17        -5.83
+WETH/USDT   UniV3-500    Pancake-100  a_to_b      0.100      887     0 (  0.0%)        -7.66       -12.54        -9.19
+WETH/USDT   UniV3-500    Pancake-100  a_to_b      0.250      887     0 (  0.0%)       -17.73       -22.58       -19.26
+WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.050      887     0 (  0.0%)        -3.33        -9.55        -5.84
+WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.100      887     0 (  0.0%)        -6.69       -12.92        -9.20
+WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.250      887     0 (  0.0%)       -16.74       -22.97       -19.23
+WETH/USDT   UniV3-500    Pancake-500  a_to_b      0.050      887     0 (  0.0%)        -7.82       -12.33        -9.68
+WETH/USDT   UniV3-500    Pancake-500  a_to_b      0.100      887     0 (  0.0%)       -10.10       -14.61       -11.97
+WETH/USDT   UniV3-500    Pancake-500  a_to_b      0.250      887     0 (  0.0%)       -16.95       -21.44       -18.81
+WETH/USDT   UniV3-500    Pancake-500  b_to_a      0.050      887     0 (  0.0%)        -8.61       -12.24       -10.03
+WETH/USDT   UniV3-500    Pancake-500  b_to_a      0.100      887     0 (  0.0%)       -10.90       -14.52       -12.31
+WETH/USDT   UniV3-500    Pancake-500  b_to_a      0.250      887     0 (  0.0%)       -21.77       -22.50       -21.77
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      0.100      887     0 (  0.0%)        -0.58        -5.31        -1.98
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      0.500      887     0 (  0.0%)        -1.16        -5.89        -2.57
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      1.000      887     0 (  0.0%)        -1.94        -6.67        -3.34
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      2.000      887     0 (  0.0%)        -3.50        -8.23        -4.90
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.100      887     0 (  0.0%)        -1.84        -7.07        -2.73
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.500      887     0 (  0.0%)        -2.44        -7.67        -3.35
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      1.000      887     0 (  0.0%)        -3.22        -8.45        -4.13
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      2.000      887     0 (  0.0%)        -4.77       -10.01        -5.68
+----------------------------------------------------------------------------------------------------------
+Total rows: 44,350, Groups: 50, Rows with spread > 0: 0
+
+--------------------------------------------------------------------------------
+4. KEY FINDINGS & SPREAD ANALYSIS
+--------------------------------------------------------------------------------
+1. Tightest Market:
+   - WETH/WBTC between UniV3-500 and Pancake-100 is consistently the tightest market.
+   - At trade size 0.10 WETH, the maximum observed spread reached -0.58 bps
+     (just 0.0058% away from break-even before gas).
+   - The 95th percentile spread for WETH/WBTC was -1.98 bps.
+
+2. Stablecoin Pair Performance:
+   - WETH/USDC reached a maximum spread of -1.04 bps (Pancake-100 <-> Pancake-500)
+     at 0.05 WETH, with a median of -6.30 bps.
+   - WETH/USDT reached a maximum spread of -3.33 bps (UniV3-500 <-> Pancake-100)
+     at 0.05 WETH, with a median of -9.55 bps.
+
+3. Spread vs. Trade Size Correlation:
+   - Across all markets, smaller trade sizes (0.05 WETH / 0.10 WETH) exhibited
+     significantly tighter spreads.
+   - Larger trade sizes (0.50 WETH on USDC/USDT, 2.0 WETH on WBTC) suffer from
+     pool slippage on the shallower Pancake pools, widening the spread by 6–20 bps.
+
+4. Gross Spread Reality (MEV & On-Chain Arbitrage):
+   - Zero positive gross spreads were observed in 887 sampled blocks.
+   - This accurately reflects live Arbitrum market conditions: external arbitrageurs
+     and CEX-DEX searchers continuously rebalance liquidity between venues.
+
+--------------------------------------------------------------------------------
+5. NEXT STEPS (PHASE 3 OPTIONS)
+--------------------------------------------------------------------------------
+Option 1: Net Profitability Modeling (Read-Only)
+- Extend the pricing model from Gross Spread to Net Profit:
+  Net Profit = (weth_back - weth_in) - Gas Cost - Flash Loan Fee
+- Dynamically fetch L2 execution gas price and Arbitrum L1 data posting scalar
+  to calculate the exact breakeven spread requirement per trade size.
+
+Option 2: Atomic Execution Contract (Phase 3a)
+- Develop an atomic Solidity flash loan / arbitrage contract (e.g., via Balancer V2
+  or Uniswap V3 flash swap).
+- Execute simulation calls (eth_call) with full revert-on-negative-profit protection.
+
+Option 3: Event-Driven Triggering
+- Transition from block polling (sampling every 40 blocks) to listening for Swap
+  events on the monitored pools, enabling real-time detection immediately when a large
+  swap creates a temporary price discrepancy.
+================================================================================

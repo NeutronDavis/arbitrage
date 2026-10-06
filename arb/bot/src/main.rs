@@ -27,16 +27,16 @@ mod summary;
 mod watchdog;
 
 use config::Config;
-use pricing::{raw_to_weth, sushi_v2, uniswap_v3, usd_per_eth, weth_to_raw};
+use pricing::{implied_quote_per_weth, sushi_v2, uniswap_v3};
 use provider::{build_http_provider, HttpProvider};
-use strategy::{FirstLeg, MarketState, OpportunityRecord, Venue};
+use strategy::{FirstLeg, MarketSetup, MarketState, OpportunityRecord, Venue};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
     name = "arb-bot",
-    about = "Arbitrum WETH/USDC arbitrage bot (Phase 2: read-only price logger)"
+    about = "Arbitrum WETH multi-market arbitrage bot (Phase 2e: read-only price logger)"
 )]
 struct Args {
     /// Fetch quotes for exactly one block, print a human-readable table, then exit.
@@ -50,9 +50,7 @@ struct Args {
 
 /// Static context discovered once at startup.
 struct Ctx {
-    v3_pools: Vec<uniswap_v3::V3Pool>,
-    sushi_meta: Option<sushi_v2::PairMeta>,
-    trade_sizes: Vec<f64>,
+    markets: Vec<MarketSetup>,
     output_file: String,
 }
 
@@ -92,53 +90,48 @@ async fn run() -> Result<()> {
 
     let http = build_http_provider(&cfg.rpc_http)?;
 
-    // Discover configured venues:
-    let mut uni_fee_tiers = Vec::new();
-    let mut pancake_fee_tiers = Vec::new();
-    let mut sushi_enabled = false;
+    // Discover pools for each configured market
+    let mut market_setups = Vec::new();
+    for m_cfg in &cfg.markets {
+        info!(pair = %m_cfg.pair, venues = ?m_cfg.venues, "Discovering pools for market…");
+        let pools = uniswap_v3::discover_market_pools(
+            &http,
+            &m_cfg.pair,
+            m_cfg.quote_token,
+            &m_cfg.venues,
+        )
+        .await
+        .with_context(|| format!("Pool discovery failed for market {}", m_cfg.pair))?;
 
-    for venue in &cfg.venues {
-        match venue {
-            Venue::UniswapV3 { fee } => uni_fee_tiers.push(*fee),
-            Venue::PancakeV3 { fee } => pancake_fee_tiers.push(*fee),
-            Venue::SushiV2 => sushi_enabled = true,
+        let sushi_meta = if m_cfg.symbol == "USDC" && m_cfg.venues.contains(&Venue::SushiV2) {
+            info!("Loading SushiSwap V2 pair metadata for WETH/USDC…");
+            let meta = sushi_v2::get_pair_meta(&http)
+                .await
+                .context("Failed to read Sushi pair token ordering")?;
+            info!(weth_is_token0 = meta.weth_is_token0, "Sushi pair meta loaded");
+            Some(meta)
+        } else {
+            None
+        };
+
+        if pools.is_empty() && sushi_meta.is_none() {
+            warn!(pair = %m_cfg.pair, "No active pools discovered with >=10 WETH for market");
         }
+
+        for p in &pools {
+            info!(pair = %p.pair, venue = %p.venue, pool = %p.address, "Active pool configured");
+        }
+
+        market_setups.push(MarketSetup {
+            config: m_cfg.clone(),
+            pools,
+            sushi_meta,
+        });
     }
 
-    let mut v3_pools = Vec::new();
-    if !uni_fee_tiers.is_empty() {
-        info!(tiers = ?uni_fee_tiers, "Discovering Uniswap V3 pools…");
-        let pools = uniswap_v3::discover_uniswap_pools(&http, &uni_fee_tiers)
-            .await
-            .context("Uniswap V3 pool discovery failed")?;
-        v3_pools.extend(pools);
-    }
-
-    if !pancake_fee_tiers.is_empty() {
-        info!(tiers = ?pancake_fee_tiers, "Discovering PancakeSwap V3 pools…");
-        let pools = uniswap_v3::discover_pancake_pools(&http, &pancake_fee_tiers)
-            .await
-            .context("PancakeSwap V3 pool discovery failed")?;
-        v3_pools.extend(pools);
-    }
-
-    let sushi_meta = if sushi_enabled {
-        info!("Loading SushiSwap V2 pair metadata…");
-        let meta = sushi_v2::get_pair_meta(&http)
-            .await
-            .context("Failed to read Sushi pair token ordering")?;
-        info!(weth_is_token0 = meta.weth_is_token0, "Sushi pair meta loaded");
-        Some(meta)
-    } else {
-        None
-    };
-
-    if v3_pools.is_empty() && sushi_meta.is_none() {
-        anyhow::bail!("No active pools discovered — check VENUES configuration and contract addresses");
-    }
-
-    for p in &v3_pools {
-        info!(venue = %p.venue, pool = %p.address, "Active pool configured");
+    let total_active_pools: usize = market_setups.iter().map(|m| m.pools.len()).sum();
+    if total_active_pools == 0 && !market_setups.iter().any(|m| m.sushi_meta.is_some()) {
+        anyhow::bail!("No active pools discovered across any market — check MARKETS/VENUES configuration");
     }
 
     // Ensure output directory exists.
@@ -151,13 +144,12 @@ async fn run() -> Result<()> {
     info!(
         rpc_calls_per_processed_block = calls,
         log_every_n_blocks = cfg.log_every_n_blocks,
+        markets = cfg.markets.len(),
         "RPC budget (Multicall3 batched)"
     );
 
     let ctx = Ctx {
-        v3_pools,
-        sushi_meta,
-        trade_sizes: cfg.trade_sizes_weth.clone(),
+        markets: market_setups,
         output_file: cfg.output_file.clone(),
     };
 
@@ -171,14 +163,6 @@ async fn run() -> Result<()> {
     }
 
     // Continuous block loop with lag detection and watchdog.
-    //
-    // Processing of a sampled block must finish before the next sampled block starts.
-    // If block processing falls behind, the newly arriving sampled block is skipped
-    // and a warning is logged with the lag in blocks.
-    //
-    // Watchdog: If no sampled block is processed for `cfg.watchdog_secs`, log an ERROR
-    // and exit with code 1 so an external restart loop can restart the process.
-    // The watchdog timer arms once the WebSocket subscription is established.
     let log_every = cfg.log_every_n_blocks;
     let ctx = std::sync::Arc::new(ctx);
     let http = std::sync::Arc::new(http);
@@ -284,9 +268,7 @@ async fn process_block(
     // All per-block reads and quotes executed in 2 aggregate3 calls pinned to `block`.
     let batched = strategy::process_block_batched(
         http,
-        &ctx.v3_pools,
-        ctx.sushi_meta,
-        &ctx.trade_sizes,
+        &ctx.markets,
         block,
     )
     .await?;
@@ -309,6 +291,11 @@ async fn process_block(
     info!(
         block = block_num,
         rpc_calls = rpc_calls,
+        batch1_calls = batched.batch1_calls,
+        batch2_calls = batched.batch2_calls,
+        batch1_payload = batched.batch1_payload_bytes,
+        batch2_payload = batched.batch2_payload_bytes,
+        max_gas_estimate = batched.max_gas_estimate,
         records = records.len(),
         best_bps = records.first().map(|r| r.gross_spread_bps).unwrap_or(f64::NAN),
         elapsed_ms = t0.elapsed().as_millis(),
@@ -318,35 +305,33 @@ async fn process_block(
     strategy::append_jsonl(&ctx.output_file, &records)?;
 
     if dry_run {
-        print_prices(&batched.state, &batched.first);
-        print_sanity(&batched.first);
-        // Cross-check local Sushi math against the deployed router (+1 RPC call) if Sushi is active.
-        if ctx.sushi_meta.is_some() {
-            if let Some(ref sushi_reserves) = batched.state.sushi {
-                if let Some(&size) = ctx.trade_sizes.first() {
-                    match sushi_v2::cross_check_router(http, sushi_reserves, weth_to_raw(size), block).await {
-                        Ok(c) => println!(
-                            "Sushi CPF cross-check @ {} WETH: local={} router={} diff={}  {}",
-                            raw_to_weth(c.amount_in),
-                            c.local_out,
-                            c.router_out,
-                            c.local_out.abs_diff(c.router_out),
-                            if c.local_out == c.router_out { "OK (exact)" } else { "MISMATCH" }
-                        ),
-                        Err(e) => println!(
-                            "Sushi CPF cross-check failed: {}",
-                            provider::redact_urls(&format!("{e:#}"))
-                        ),
-                    }
-                }
-            }
-        }
-        print_spreads(&records);
+        print_market_snapshot(&ctx.markets, &batched.state, &batched.first);
+        print_spreads_per_market(&records);
+
         println!(
-            "\nWrote {} records to {} (block {}, {} ms)\n",
+            "\n══ RPC Multicall Metrics (Block {}) ══",
+            block_num
+        );
+        println!(
+            "  Total RPC Calls: {}",
+            rpc_calls
+        );
+        println!(
+            "  Batch 1 (State + 1st legs): {} calls, {} bytes calldata",
+            batched.batch1_calls, batched.batch1_payload_bytes
+        );
+        println!(
+            "  Batch 2 (2nd legs):        {} calls, {} bytes calldata",
+            batched.batch2_calls, batched.batch2_payload_bytes
+        );
+        println!(
+            "  Largest eth_call gas estimate: {}",
+            batched.max_gas_estimate
+        );
+        println!(
+            "\nWrote {} records to {} ({} ms)\n",
             records.len(),
             ctx.output_file,
-            block_num,
             t0.elapsed().as_millis()
         );
     }
@@ -355,79 +340,90 @@ async fn process_block(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// RPC calls per processed block (continuous mode):
-/// Batch 1 (state + first legs) + Batch 2 (second legs) = 2 Multicall3 aggregate3 calls.
-/// Block numbers arrive via the WS subscription (no extra call).
-/// `--dry-run-once` adds 1 `eth_blockNumber` + 1 router cross-check (if Sushi active).
 fn rpc_calls_per_block() -> usize {
     2
 }
 
-/// Per-venue price and depth table.
-fn print_prices(state: &MarketState, first: &[FirstLeg]) {
-    println!("\n══ Venue snapshot (block-pinned) ══");
-    println!(
-        "{:<12} {:>8} {:>14} {:>24}",
-        "Venue", "Size(W)", "USD/ETH", "Depth (V3 L units)"
-    );
-    println!("{:-<62}", "");
-    for leg in first {
+/// Print implied price of the quote token per venue and verify agreement within ~10 bps.
+fn print_market_snapshot(
+    markets: &[MarketSetup],
+    state: &MarketState,
+    first: &[FirstLeg],
+) {
+    println!("\n══ Market snapshots & implied prices (block-pinned) ══");
+    for m in markets {
+        println!("\n── Market: {} (Quote Decimals: {}) ──", m.config.pair, m.config.quote_decimals);
         println!(
-            "{:<12} {:>8.3} {:>14.2} {:>24}",
-            leg.venue.to_string(),
-            leg.size_weth,
-            usd_per_eth(leg.weth_in, leg.usdc_out),
-            state.liquidity(leg.venue)
+            "{:<12} {:>8} {:>18} {:>24}",
+            "Venue", "Size(W)", format!("{}/WETH", m.config.symbol), "Depth (V3 L units)"
         );
-    }
-    if let Some(ref sushi) = state.sushi {
-        println!(
-            "SushiV2 reserves: {:.6} WETH / {:.2} USDC",
-            raw_to_weth(sushi.reserve_weth),
-            sushi.reserve_usdc as f64 / 1e6
-        );
+        println!("{:-<66}", "");
+        let market_first: Vec<&FirstLeg> = first.iter().filter(|l| l.pair == m.config.pair).collect();
+        for leg in &market_first {
+            let rate = implied_quote_per_weth(leg.weth_in, leg.quote_out, leg.quote_decimals);
+            println!(
+                "{:<12} {:>8.3} {:>18.4} {:>24}",
+                leg.venue.to_string(),
+                leg.size_weth,
+                rate,
+                state.pool_liquidity(&leg.pair, leg.venue)
+            );
+        }
+
+        // Check agreement across venues at the smallest quoted trade size
+        if let Some(min_size) = market_first.iter().map(|l| l.size_weth).reduce(f64::min) {
+            let small_legs: Vec<&&FirstLeg> = market_first.iter().filter(|l| l.size_weth == min_size).collect();
+            if let Some(ref_leg) = small_legs.first() {
+                let ref_rate = implied_quote_per_weth(ref_leg.weth_in, ref_leg.quote_out, ref_leg.quote_decimals);
+                println!("  Implied price agreement @ {:.3} WETH (ref: {}):", min_size, ref_leg.venue);
+                for l in &small_legs {
+                    let rate = implied_quote_per_weth(l.weth_in, l.quote_out, l.quote_decimals);
+                    let diff_bps = if ref_rate > 0.0 { ((rate - ref_rate) / ref_rate) * 10_000.0 } else { 0.0 };
+                    let agree = if diff_bps.abs() <= 10.0 {
+                        "AGREES (within 10 bps)"
+                    } else {
+                        "SLIGHT DIVERGENCE (>10 bps)"
+                    };
+                    println!(
+                        "    {:<12}: {:>14.4} (diff: {:>+6.2} bps)  {}",
+                        l.venue.to_string(),
+                        rate,
+                        diff_bps,
+                        agree
+                    );
+                }
+            }
+        }
     }
 }
 
-/// Decimals sanity check: smallest-size price per venue vs the deepest V3 tier.
-fn print_sanity(first: &[FirstLeg]) {
-    let Some(min_size) = first.iter().map(|l| l.size_weth).reduce(f64::min) else {
-        return;
-    };
-    let small: Vec<&FirstLeg> = first.iter().filter(|l| l.size_weth == min_size).collect();
-    let Some(reference) = small
-        .iter()
-        .find(|l| l.venue == Venue::UniswapV3 { fee: 500 })
-        .or_else(|| small.iter().find(|l| l.venue == Venue::PancakeV3 { fee: 500 }))
-        .or(small.first())
-    else {
-        return;
-    };
-    let ref_px = usd_per_eth(reference.weth_in, reference.usdc_out);
-    println!("\n══ Decimals sanity @ {min_size} WETH (vs {}) ══", reference.venue);
-    for l in &small {
-        let px = usd_per_eth(l.weth_in, l.usdc_out);
-        let dev = if ref_px > 0.0 { (px / ref_px - 1.0) * 100.0 } else { 0.0 };
-        // Fees + impact explain a few %; a decimals bug shows up as ~10^12x.
-        let verdict = if dev.abs() < 10.0 { "plausible" } else { "CHECK" };
-        println!("{:<12} {:>10.2} USD/ETH  {:>+7.2}%  {verdict}", l.venue.to_string(), px, dev);
-    }
-}
+/// Print gross spreads per market exactly as computed, without labeling negative results as good.
+fn print_spreads_per_market(records: &[OpportunityRecord]) {
+    println!("\n══ Top gross spreads per market (fees & slippage included, before gas) ══");
+    let mut pairs: Vec<String> = records.iter().map(|r| r.pair.clone()).collect();
+    pairs.sort();
+    pairs.dedup();
 
-/// Spread table, best first.
-fn print_spreads(records: &[OpportunityRecord]) {
-    println!("\n══ Round-trip gross spreads (before gas / flash fee; best first) ══");
-    println!(
-        "{:<12} {:<12} {:<8} {:>8} {:>12}",
-        "Venue A", "Venue B", "Dir", "Size(W)", "Spread(bps)"
-    );
-    println!("{:-<56}", "");
-    for r in records {
+    for pair in pairs {
+        println!("\n── Market: {} ──", pair);
         println!(
-            "{:<12} {:<12} {:<8} {:>8.3} {:>12.2}",
-            r.venue_a, r.venue_b, r.direction, r.size_weth, r.gross_spread_bps
+            "{:<12} {:<12} {:<8} {:>8} {:>14} {:>14}",
+            "Venue A", "Venue B", "Dir", "Size(W)", "Spread(bps)", "Result"
         );
+        println!("{:-<72}", "");
+        let market_recs: Vec<&OpportunityRecord> = records.iter().filter(|r| r.pair == pair).collect();
+        for r in market_recs {
+            let verdict = if r.gross_spread_bps >= 0.0 {
+                "PROFITABLE"
+            } else {
+                "NET LOSS"
+            };
+            println!(
+                "{:<12} {:<12} {:<8} {:>8.3} {:>14.2} {:>14}",
+                r.venue_a, r.venue_b, r.direction, r.size_weth, r.gross_spread_bps, verdict
+            );
+        }
     }
-    println!("Dir: a_to_b = WETH->USDC on A, USDC->WETH on B; b_to_a = reverse.");
+    println!("\nNote: Spreads are reported exactly as computed: negative indicates a loss.");
 }
 

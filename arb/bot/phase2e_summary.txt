@@ -1,0 +1,265 @@
+================================================================================
+PHASE 2e SUMMARY REPORT: MULTI-MARKET ARBITRAGE LOGGER (READ-ONLY)
+================================================================================
+Date: 2026-10-05
+Chain: Arbitrum One (Chain ID: 42161)
+Status: Completed, Verified On-Chain, Ready for Review (Read-Only)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW & OBJECTIVES
+--------------------------------------------------------------------------------
+Phase 2e generalized the read-only arbitrage logger from a single market
+(WETH/USDC) to multiple concurrent markets:
+  1. WETH/USDC (6 decimals)
+  2. WETH/WBTC (8 decimals)
+  3. WETH/USDT (6 decimals)
+
+Key requirements & constraints strictly maintained:
+- Read-only execution: no transactions, no wallet, no private keys.
+- No .env files created, edited, read, or deleted; no secrets printed.
+- Preserved exactly 2 Multicall3 aggregate3 RPC calls per processed block across ALL
+  markets and venues combined (Batch 1: reads + 1st legs; Batch 2: 2nd legs).
+- Zero RPC calls for SushiSwap V2 math (local constant-product formula).
+- Bounded test execution using timeout and temporary output files.
+- Accurate reporting of gross spreads: negative numbers explicitly indicate net losses;
+  never labeled as good.
+- Strict backwards compatibility: old JSONL rows without a `pair` field parse and
+  summarize seamlessly as "WETH/USDC".
+
+--------------------------------------------------------------------------------
+2. CODE CHANGES & ARCHITECTURE
+--------------------------------------------------------------------------------
+1. src/constants.rs:
+   - Added WBTC (0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f, 8 decimals)
+     Source: Official Arbitrum Token List & Arbiscan token page
+     On-chain verified: symbol()="WBTC", decimals()=8.
+   - Added USDT (0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9, 6 decimals)
+     Source: Tether official transparency deployments & Arbiscan token page
+     On-chain verified: symbol()="USDT", decimals()=6.
+
+2. src/config.rs:
+   - Introduced `MarketConfig`:
+     * `symbol`: e.g. "USDC", "WBTC", "USDT"
+     * `pair`: e.g. "WETH/USDC", "WETH/WBTC", "WETH/USDT"
+     * `quote_token`: Address
+     * `quote_decimals`: u8
+     * `venues`: Vec<Venue>
+     * `trade_sizes_weth`: Vec<f64>
+   - Multi-market configuration via optional `MARKETS` env var (default: "USDC,WBTC,USDT"):
+     * WETH/USDC: UniV3-500, Pancake-100, Pancake-500; sizes: [0.05, 0.1, 0.25, 0.5]
+     * WETH/WBTC: UniV3-500, Pancake-100; sizes: [0.1, 0.5, 1.0, 2.0]
+     * WETH/USDT: UniV3-500, Pancake-100, Pancake-500; sizes: [0.05, 0.1, 0.25]
+   - Decision on `VENUES` and `TRADE_SIZES_WETH`: Retained as overrides specific to
+     `WETH/USDC` to ensure full backwards compatibility with existing test scripts.
+
+3. src/pricing/uniswap_v3.rs & src/pricing/mod.rs:
+   - Extended `V3Pool` with `pair: String` and `quote_token: Address`.
+   - Implemented `discover_market_pools`:
+     * Queries `feeAmountTickSpacing > 0` on factory (UniV3 or PancakeV3).
+     * Discovers pool address via `getPool(WETH, quote_token, fee)`.
+     * Queries `balanceOf(pool)` on WETH and skips any pool with < 10 WETH with a warning.
+   - Generalized `build_quote_call` to take `token_in` and `token_out` directly.
+   - Updated `decode_quote_result` to return `Option<(U256, u64)>` (amount out, gas estimate).
+   - Added `implied_quote_per_weth` helper for multi-decimal quote token rate calculations.
+
+4. src/strategy.rs:
+   - Generalized `FirstLeg` and `RoundTrip` with `pair`, `quote_token`, `quote_decimals`,
+     and `mid_amount` (raw units of quote token).
+   - Updated `OpportunityRecord`:
+     * `pair`: String (defaults to "WETH/USDC" when deserializing old records).
+     * `mid_amount`: String (raw quote units).
+     * `usdc_mid`: String (filled for WETH/USDC rows, empty string for other pairs).
+   - Updated `process_block_batched`:
+     * Packages all pool reads, timestamp, and first-leg quotes for ALL markets into Batch 1.
+     * Packages all cross-venue second-leg quotes for ALL markets into Batch 2.
+     * Computes payload bytes for both batches and tracks `max_gas_estimate`.
+     * Total RPC calls per processed block remains strictly 2.
+
+5. src/summary.rs:
+   - Grouping key updated to `(pair, venue_a, venue_b, direction, size_weth)`.
+   - Legacy rows without `pair` automatically default to "WETH/USDC".
+   - Unit tests added and passing: `test_summarize_multi_pair_and_legacy_rows`.
+
+6. src/main.rs:
+   - Startup discovery across all markets.
+   - `--dry-run-once` snapshot displays per-market implied prices and confirms venue
+     agreement within 10 bps.
+   - Displays top gross spreads per market, explicitly labeling negative spreads as NET LOSS.
+   - Logs Multicall3 call counts, payload sizes, and largest gas estimate per block.
+
+--------------------------------------------------------------------------------
+3. ON-CHAIN PARITY VERIFICATION (Block 511876947)
+--------------------------------------------------------------------------------
+Tested via `cargo run --bin verify_parity` on Arbitrum One block 511876947:
+
+Value Checked                        Direct Unbatched (cast)    Multicall3 Batched       Status
+------------------------------------------------------------------------------------------------
+1. Pancake-100 WBTC Liquidity        11905512063758623          11905512063758623        EXACT MATCH
+2. UniV3-500 WBTC Quote (0.1W)       315833 (0.00315833 WBTC)   315833                   EXACT MATCH
+3. Pancake-500 USDT Quote (0.05W)    135913169 (135.913169 USDT)135913169                EXACT MATCH
+
+All 3 values match exactly between direct execution and Multicall3 batched execution.
+
+Direct cast call verification commands:
+- Pancake-100 WBTC Liquidity:
+  cast call --block 511876947 0x4bfc22A4dA7f31F8a912a79A7e44a822398b4390 "liquidity()(uint128)"
+  => 11905512063758623
+- UniV3-500 WBTC Quote (0.1 WETH):
+  cast call --block 511876947 0x61fFE014bA17989E743c5F6cB21bF9697530B21e \
+    "quoteExactInputSingle((address,address,uint256,uint24,uint160))((uint256,uint160,uint32,uint256))" \
+    "(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1,0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f,100000000000000000,500,0)"
+  => 315833
+- Pancake-500 USDT Quote (0.05 WETH):
+  cast call --block 511876947 0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997 \
+    "quoteExactInputSingle((address,address,uint256,uint24,uint160))((uint256,uint160,uint32,uint256))" \
+    "(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1,0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9,50000000000000000,500,0)"
+  => 135913169
+
+--------------------------------------------------------------------------------
+4. --dry-run-once SNAPSHOT TABLE (Block 511879006)
+--------------------------------------------------------------------------------
+Command: cargo run --release -- --dry-run-once
+
+══ Market snapshots & implied prices (block-pinned) ══
+
+── Market: WETH/USDC (Quote Decimals: 6) ──
+Venue         Size(W)          USDC/WETH       Depth (V3 L units)
+------------------------------------------------------------------
+UniV3-500       0.050          2716.8616      4087294613159662805
+UniV3-500       0.100          2716.8599      4087294613159662805
+UniV3-500       0.250          2716.8547      4087294613159662805
+UniV3-500       0.500          2716.8460      4087294613159662805
+Pancake-100     0.050          2716.8197        28952258674882978
+Pancake-100     0.100          2716.5752        28952258674882978
+Pancake-100     0.250          2715.8420        28952258674882978
+Pancake-100     0.500          2714.6207        28952258674882978
+Pancake-500     0.050          2716.6457        83170061980067227
+Pancake-500     0.100          2716.5606        83170061980067227
+Pancake-500     0.250          2716.3053        83170061980067227
+Pancake-500     0.500          2715.8800        83170061980067227
+  Implied price agreement @ 0.050 WETH (ref: UniV3-500):
+    UniV3-500   :      2716.8616 (diff:  +0.00 bps)  AGREES (within 10 bps)
+    Pancake-100 :      2716.8197 (diff:  -0.15 bps)  AGREES (within 10 bps)
+    Pancake-500 :      2716.6457 (diff:  -0.79 bps)  AGREES (within 10 bps)
+
+── Market: WETH/WBTC (Quote Decimals: 8) ──
+Venue         Size(W)          WBTC/WETH       Depth (V3 L units)
+------------------------------------------------------------------
+UniV3-500       0.100             0.0316       272041278694747195
+UniV3-500       0.500             0.0316       272041278694747195
+UniV3-500       1.000             0.0316       272041278694747195
+UniV3-500       2.000             0.0316       272041278694747195
+Pancake-100     0.100             0.0316        11905512063758623
+Pancake-100     0.500             0.0316        11905512063758623
+Pancake-100     1.000             0.0316        11905512063758623
+Pancake-100     2.000             0.0316        11905512063758623
+  Implied price agreement @ 0.100 WETH (ref: UniV3-500):
+    UniV3-500   :         0.0316 (diff:  +0.00 bps)  AGREES (within 10 bps)
+    Pancake-100 :         0.0316 (diff:  +6.80 bps)  AGREES (within 10 bps)
+
+── Market: WETH/USDT (Quote Decimals: 6) ──
+Venue         Size(W)          USDT/WETH       Depth (V3 L units)
+------------------------------------------------------------------
+UniV3-500       0.050          2717.3938       436326288308143078
+UniV3-500       0.100          2717.3775       436326288308143078
+UniV3-500       0.250          2717.3289       436326288308143078
+Pancake-100     0.050          2716.9855         7871972994856183
+Pancake-100     0.100          2716.0887         7871972994856183
+Pancake-100     0.250          2713.4020         7871972994856183
+Pancake-500     0.050          2717.0647        11697920747085679
+Pancake-500     0.100          2716.4597        11697920747085679
+Pancake-500     0.250          2714.6463        11697920747085679
+  Implied price agreement @ 0.050 WETH (ref: UniV3-500):
+    UniV3-500   :      2717.3938 (diff:  +0.00 bps)  AGREES (within 10 bps)
+    Pancake-100 :      2716.9855 (diff:  -1.50 bps)  AGREES (within 10 bps)
+    Pancake-500 :      2717.0647 (diff:  -1.21 bps)  AGREES (within 10 bps)
+
+Top Gross Spreads per Market (All negative = Net Loss):
+- WETH/USDC: Best spread is -3.65 bps (UniV3-500 -> Pancake-100 @ 0.05 WETH).
+- WETH/USDT: Best spread is -7.11 bps (UniV3-500 -> Pancake-100 @ 0.05 WETH).
+- WETH/WBTC: Best spread is -3.25 bps (Pancake-100 -> UniV3-500 @ 0.10 WETH).
+
+Multicall Metrics:
+- Total RPC Calls: 2
+- Batch 1: 38 calls, 10,788 bytes
+- Batch 2: 50 calls, 16,068 bytes
+- Largest eth_call gas estimate: 771,828
+
+--------------------------------------------------------------------------------
+5. 180-SECOND BOUNDED LIVE TEST
+--------------------------------------------------------------------------------
+Output file: data/test_phase2e.jsonl (temporary file; data/opportunities.jsonl untouched)
+Test duration: 180 seconds
+Blocks sampled: 15 distinct blocks (511881560 to 511882120, sampled every 40 blocks)
+Records per block: 50 records
+Total records written: 750 rows
+Process errors: 0
+Lag warnings / dropped blocks: 0
+RPC calls per processed block: exactly 2
+Average processing latency per block: ~435-450 ms
+
+Summarizer Output (`target\release\summarize.exe data/test_phase2e.jsonl`):
+
+Pair        Venue A      Venue B      Dir       Size(W)     Rows     Spread > 0     Max(bps)  Median(bps)     P95(bps)
+----------------------------------------------------------------------------------------------------------
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.050       15     0 (  0.0%)        -3.40        -6.98        -3.40
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.100       15     0 (  0.0%)        -4.62        -8.19        -4.62
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.250       15     0 (  0.0%)        -8.26       -11.83        -8.26
+WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.500       15     0 (  0.0%)       -14.32       -17.88       -14.32
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.050       15     0 (  0.0%)        -3.01        -7.45        -3.01
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.100       15     0 (  0.0%)        -4.22        -8.66        -4.22
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.250       15     0 (  0.0%)        -7.86       -12.30        -7.86
+WETH/USDC   Pancake-100  Pancake-500  b_to_a      0.500       15     0 (  0.0%)       -13.93       -18.36       -13.93
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.050       15     0 (  0.0%)        -2.54        -6.04        -2.54
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.100       15     0 (  0.0%)        -3.44        -6.95        -3.44
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.250       15     0 (  0.0%)        -6.16        -9.67        -6.16
+WETH/USDC   UniV3-500    Pancake-100  a_to_b      0.500       15     0 (  0.0%)       -10.70       -14.20       -10.70
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.050       15     0 (  0.0%)        -4.20        -7.77        -4.20
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.100       15     0 (  0.0%)        -5.11        -8.68        -5.11
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.250       15     0 (  0.0%)        -7.83       -11.40        -7.83
+WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.500       15     0 (  0.0%)       -12.36       -15.93       -12.36
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.050       15     0 (  0.0%)        -9.21        -9.21        -9.21
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.100       15     0 (  0.0%)        -9.53        -9.53        -9.53
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.250       15     0 (  0.0%)       -10.49       -10.49       -10.49
+WETH/USDC   UniV3-500    Pancake-500  a_to_b      0.500       15     0 (  0.0%)       -12.09       -12.09       -12.09
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.050       15     0 (  0.0%)       -10.49       -11.42       -10.49
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.100       15     0 (  0.0%)       -10.80       -11.74       -10.80
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.250       15     0 (  0.0%)       -11.76       -12.70       -11.76
+WETH/USDC   UniV3-500    Pancake-500  b_to_a      0.500       15     0 (  0.0%)       -13.36       -14.30       -13.36
+WETH/USDT   Pancake-100  Pancake-500  a_to_b      0.050       15     0 (  0.0%)        -8.49        -8.49        -8.49
+WETH/USDT   Pancake-100  Pancake-500  a_to_b      0.100       15     0 (  0.0%)       -14.02       -14.02       -14.02
+WETH/USDT   Pancake-100  Pancake-500  a_to_b      0.250       15     0 (  0.0%)       -30.55       -30.55       -30.55
+WETH/USDT   Pancake-100  Pancake-500  b_to_a      0.050       15     0 (  0.0%)        -7.18       -14.57        -7.18
+WETH/USDT   Pancake-100  Pancake-500  b_to_a      0.100       15     0 (  0.0%)       -12.71       -20.09       -12.71
+WETH/USDT   Pancake-100  Pancake-500  b_to_a      0.250       15     0 (  0.0%)       -29.23       -36.58       -29.23
+WETH/USDT   UniV3-500    Pancake-100  a_to_b      0.050       15     0 (  0.0%)        -4.66       -11.32        -4.66
+WETH/USDT   UniV3-500    Pancake-100  a_to_b      0.100       15     0 (  0.0%)        -8.02       -14.68        -8.02
+WETH/USDT   UniV3-500    Pancake-100  a_to_b      0.250       15     0 (  0.0%)       -18.08       -24.72       -18.08
+WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.050       15     0 (  0.0%)        -7.41        -7.41        -7.41
+WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.100       15     0 (  0.0%)       -10.77       -10.77       -10.77
+WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.250       15     0 (  0.0%)       -20.84       -20.84       -20.84
+WETH/USDT   UniV3-500    Pancake-500  a_to_b      0.050       15     0 (  0.0%)       -11.20       -11.20       -11.20
+WETH/USDT   UniV3-500    Pancake-500  a_to_b      0.100       15     0 (  0.0%)       -13.48       -13.48       -13.48
+WETH/USDT   UniV3-500    Pancake-500  a_to_b      0.250       15     0 (  0.0%)       -20.32       -20.32       -20.32
+WETH/USDT   UniV3-500    Pancake-500  b_to_a      0.050       15     0 (  0.0%)       -12.64       -13.37       -12.64
+WETH/USDT   UniV3-500    Pancake-500  b_to_a      0.100       15     0 (  0.0%)       -14.93       -15.65       -14.93
+WETH/USDT   UniV3-500    Pancake-500  b_to_a      0.250       15     0 (  0.0%)       -21.77       -22.50       -21.77
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      0.100       15     0 (  0.0%)        -2.78        -3.02        -2.78
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      0.500       15     0 (  0.0%)        -3.37        -3.62        -3.37
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      1.000       15     0 (  0.0%)        -4.14        -4.39        -4.14
+WETH/WBTC   UniV3-500    Pancake-100  a_to_b      2.000       15     0 (  0.0%)        -5.70        -5.95        -5.70
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.100       15     0 (  0.0%)        -8.70        -9.36        -8.70
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.500       15     0 (  0.0%)        -9.29        -9.95        -9.29
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      1.000       15     0 (  0.0%)       -10.07       -10.73       -10.07
+WETH/WBTC   UniV3-500    Pancake-100  b_to_a      2.000       15     0 (  0.0%)       -11.63       -12.28       -11.63
+----------------------------------------------------------------------------------------------------------
+Total rows: 750, Groups: 50, Rows with spread > 0: 0
+
+--------------------------------------------------------------------------------
+6. TEST AND COMPILATION VERIFICATION
+--------------------------------------------------------------------------------
+- `cargo check`: Passed (0 errors, 0 warnings).
+- `cargo clippy --all-targets -- -D warnings`: Passed (0 warnings).
+- `cargo test`: Passed (26/26 tests passed, including multi-pair summarization & legacy rows).
+- `cargo build --release`: Passed.
+================================================================================

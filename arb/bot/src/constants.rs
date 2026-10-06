@@ -17,6 +17,26 @@ pub const WETH: &str = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 /// and https://www.circle.com/blog/usdc-now-available-natively-on-arbitrum
 pub const USDC: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 
+/// Wrapped Bitcoin (WBTC) on Arbitrum One (canonical Arbitrum bridge token, 8 decimals).
+/// Source: https://developer.arbitrum.io/useful-addresses and https://arbiscan.io/token/0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f
+/// On-chain verified 2026-10-04 (Phase 2d):
+///   Bytecode size: 760 bytes
+///   symbol()    -> "WBTC"
+///   decimals()  -> 8
+///   l1Address() -> 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599 (L1 WBTC)
+///   l2Gateway() -> 0x09e9222E96E7B4AE2a407B98d48e330053351EEe (Standard Arbitrum Gateway)
+pub const WBTC: &str = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f";
+
+/// Tether USD (USD₮0) on Arbitrum One (Tether-issued, 6 decimals).
+/// Source: https://tether.to/en/supported-protocols and https://arbiscan.io/token/0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9
+/// On-chain verified 2026-10-04 (Phase 2d):
+///   Bytecode size: 2,141 bytes
+///   symbol()    -> "USD₮0"
+///   decimals()  -> 6
+///   EIP-1967 implementation -> 0x3263cd783823d04a6b9819517e0e6840d37ca3f4
+///   EIP-1967 admin          -> 0x553ec478a66be27ba25a6bc5db20aec2ed6a1b4a
+pub const USDT: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
+
 // ── Multicall3 ────────────────────────────────────────────────────────────────
 
 /// Multicall3 on Arbitrum One (chain ID 42161).
