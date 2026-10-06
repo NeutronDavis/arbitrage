@@ -77,3 +77,44 @@ pub async fn aggregate3<P: Provider>(
         .map_err(|e| anyhow!("Multicall3.aggregate3 failed: {e}"))?;
     Ok(results)
 }
+
+/// Default maximum number of calls packed into a single Multicall3 aggregate3 RPC call.
+/// Keeps individual eth_call payloads and gas well within provider limits.
+pub const DEFAULT_CHUNK_SIZE: usize = 40;
+
+/// Execute a list of calls chunked into batches of at most `chunk_size` calls.
+/// Returns the aggregated results in the original index order, along with the count of RPC calls made.
+pub async fn aggregate3_chunked<P: Provider>(
+    provider: &P,
+    calls: Vec<Call3>,
+    block: BlockId,
+    chunk_size: usize,
+) -> Result<(Vec<MulticallResult>, usize)> {
+    if calls.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let chunk_size = if chunk_size == 0 { DEFAULT_CHUNK_SIZE } else { chunk_size };
+    if calls.len() <= chunk_size {
+        let res = aggregate3(provider, calls, block).await?;
+        return Ok((res, 1));
+    }
+
+    let chunks: Vec<Vec<Call3>> = calls
+        .chunks(chunk_size)
+        .map(|c| c.to_vec())
+        .collect();
+    let num_chunks = chunks.len();
+
+    let mut futs = Vec::with_capacity(num_chunks);
+    for chunk in chunks {
+        futs.push(aggregate3(provider, chunk, block));
+    }
+
+    let chunk_results = futures_util::future::try_join_all(futs).await?;
+    let mut flat = Vec::with_capacity(calls.len());
+    for r in chunk_results {
+        flat.extend(r);
+    }
+
+    Ok((flat, num_chunks))
+}

@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 
 mod config;
 mod constants;
+mod discover;
 mod executor;
 mod logging;
 mod multicall;
@@ -24,6 +25,7 @@ mod pricing;
 mod provider;
 mod strategy;
 mod summary;
+mod tokens;
 mod watchdog;
 
 use config::Config;
@@ -36,16 +38,32 @@ use strategy::{FirstLeg, MarketSetup, MarketState, OpportunityRecord, Venue};
 #[derive(Parser, Debug)]
 #[command(
     name = "arb-bot",
-    about = "Arbitrum WETH multi-market arbitrage bot (Phase 2e: read-only price logger)"
+    about = "Arbitrum WETH multi-market arbitrage bot (Phase 2f: read-only price logger)"
 )]
 struct Args {
     /// Fetch quotes for exactly one block, print a human-readable table, then exit.
     #[arg(long, default_value_t = false)]
     dry_run_once: bool,
 
+    /// Discover pools and markets across UniV3 and PancakeV3 from tokens.toml.
+    #[arg(long, default_value_t = false)]
+    discover: bool,
+
+    /// Minimum WETH balance required for a pool to be kept (default: 10.0 WETH).
+    #[arg(long)]
+    min_pool_weth: Option<f64>,
+
     /// Summarise a JSONL opportunity log and exit.
     #[arg(long)]
     summarize: Option<Option<String>>,
+
+    /// Show top N ranked groups in the summary (by max spread, rows above -2 bps, and persistence).
+    #[arg(long)]
+    top: Option<usize>,
+
+    /// Minimum gross profit in USD for the profit threshold column in summary (default: 0.01).
+    #[arg(long, default_value_t = 0.01)]
+    usd_min: f64,
 }
 
 /// Static context discovered once at startup.
@@ -75,20 +93,27 @@ async fn run() -> Result<()> {
         let path = path_opt.unwrap_or_else(|| "data/opportunities.jsonl".into());
         let file = std::fs::File::open(&path)
             .with_context(|| format!("Cannot open JSONL file: {path}"))?;
-        let stats = summary::summarize_reader(std::io::BufReader::new(file))?;
+        let stats = summary::summarize_reader_with_usd_min(std::io::BufReader::new(file), args.usd_min)?;
         println!("File: {path}");
-        summary::print_summary(&stats);
+        summary::print_summary(&stats, args.top, args.usd_min);
         return Ok(());
     }
 
     let cfg = Config::from_env().context("Failed to load configuration")?;
 
+    let http = build_http_provider(&cfg.rpc_http)?;
+
+    // If --discover is requested, run pool discovery and write data/markets.json
+    if args.discover {
+        let min_weth = args.min_pool_weth.unwrap_or(10.0);
+        discover::run_discovery(&http, min_weth, "data/markets.json").await?;
+        return Ok(());
+    }
+
     // Safety check: never run transactions in Phase 2.
     if cfg.execution_enabled {
         warn!("EXECUTION_ENABLED=true is set but Phase 2 is read-only. Ignoring.");
     }
-
-    let http = build_http_provider(&cfg.rpc_http)?;
 
     // Discover pools for each configured market
     let mut market_setups = Vec::new();
@@ -265,7 +290,7 @@ async fn process_block(
     let t0 = std::time::Instant::now();
     let block = BlockId::number(block_num);
 
-    // All per-block reads and quotes executed in 2 aggregate3 calls pinned to `block`.
+    // All per-block reads and quotes executed via chunked Multicall3 pinned to `block`.
     let batched = strategy::process_block_batched(
         http,
         &ctx.markets,
@@ -284,18 +309,22 @@ async fn process_block(
         logged_at,
         &batched.state,
         &batched.trips,
+        batched.eth_usd_price,
     );
 
-    let rpc_calls = rpc_calls_per_block();
+    let rpc_calls = batched.total_rpc_calls;
 
     info!(
         block = block_num,
         rpc_calls = rpc_calls,
+        batch1_rpc = batched.batch1_rpc_calls,
+        batch2_rpc = batched.batch2_rpc_calls,
         batch1_calls = batched.batch1_calls,
         batch2_calls = batched.batch2_calls,
         batch1_payload = batched.batch1_payload_bytes,
         batch2_payload = batched.batch2_payload_bytes,
         max_gas_estimate = batched.max_gas_estimate,
+        eth_usd_price = batched.eth_usd_price,
         records = records.len(),
         best_bps = records.first().map(|r| r.gross_spread_bps).unwrap_or(f64::NAN),
         elapsed_ms = t0.elapsed().as_millis(),
@@ -313,20 +342,24 @@ async fn process_block(
             block_num
         );
         println!(
-            "  Total RPC Calls: {}",
-            rpc_calls
+            "  Total eth_call RPCs: {} (Batch 1: {} chunks, Batch 2: {} chunks)",
+            rpc_calls, batched.batch1_rpc_calls, batched.batch2_rpc_calls
         );
         println!(
-            "  Batch 1 (State + 1st legs): {} calls, {} bytes calldata",
-            batched.batch1_calls, batched.batch1_payload_bytes
+            "  Batch 1 (State + 1st legs): {} calls in {} chunk(s), {} bytes calldata",
+            batched.batch1_calls, batched.batch1_rpc_calls, batched.batch1_payload_bytes
         );
         println!(
-            "  Batch 2 (2nd legs):        {} calls, {} bytes calldata",
-            batched.batch2_calls, batched.batch2_payload_bytes
+            "  Batch 2 (2nd legs):        {} calls in {} chunk(s), {} bytes calldata",
+            batched.batch2_calls, batched.batch2_rpc_calls, batched.batch2_payload_bytes
         );
         println!(
             "  Largest eth_call gas estimate: {}",
             batched.max_gas_estimate
+        );
+        println!(
+            "  ETH/USD Reference Price: ${:.2}",
+            batched.eth_usd_price
         );
         println!(
             "\nWrote {} records to {} ({} ms)\n",
@@ -407,10 +440,10 @@ fn print_spreads_per_market(records: &[OpportunityRecord]) {
     for pair in pairs {
         println!("\n── Market: {} ──", pair);
         println!(
-            "{:<12} {:<12} {:<8} {:>8} {:>14} {:>14}",
-            "Venue A", "Venue B", "Dir", "Size(W)", "Spread(bps)", "Result"
+            "{:<12} {:<12} {:<8} {:>8} {:>14} {:>12} {:>14}",
+            "Venue A", "Venue B", "Dir", "Size(W)", "Spread(bps)", "Est USD", "Result"
         );
-        println!("{:-<72}", "");
+        println!("{:-<84}", "");
         let market_recs: Vec<&OpportunityRecord> = records.iter().filter(|r| r.pair == pair).collect();
         for r in market_recs {
             let verdict = if r.gross_spread_bps >= 0.0 {
@@ -419,8 +452,8 @@ fn print_spreads_per_market(records: &[OpportunityRecord]) {
                 "NET LOSS"
             };
             println!(
-                "{:<12} {:<12} {:<8} {:>8.3} {:>14.2} {:>14}",
-                r.venue_a, r.venue_b, r.direction, r.size_weth, r.gross_spread_bps, verdict
+                "{:<12} {:<12} {:<8} {:>8.3} {:>14.2} {:>12.2} {:>14}",
+                r.venue_a, r.venue_b, r.direction, r.size_weth, r.gross_spread_bps, r.est_gross_profit_usd, verdict
             );
         }
     }

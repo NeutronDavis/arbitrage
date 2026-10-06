@@ -1,0 +1,296 @@
+================================================================================
+PHASE 2f SUMMARY REPORT: CONFIGURABLE MULTI-TOKEN SCANNER (READ-ONLY)
+================================================================================
+Date: 2026-10-06
+Chain: Arbitrum One (Chain ID: 42161)
+Status: Completed, Verified On-Chain, Phase 2f Fixes Applied & Verified (Read-Only)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW & OBJECTIVES
+--------------------------------------------------------------------------------
+Phase 2f expanded the read-only Arbitrum scanner to scan many WETH pairs across
+Uniswap V3 and PancakeSwap V3, driven by a reviewed token allowlist to identify
+pairs where cross-venue arbitrage spreads ever turn positive.
+
+Key requirements & constraints strictly maintained:
+- Read-only execution: no wallet, no transactions, no PRIVATE_KEY.
+- Security constraints: no .env files created, edited, read, or deleted; no secrets
+  or RPC URLs printed.
+- Authoritative token verification: cited source for every token (Arbiscan token
+  page), on-chain bytecode verification, symbol() check, and decimals() check.
+  Any token failing on-chain checks is marked UNVERIFIED and excluded from scans.
+- Strict Allowlist Enforcement: only entries with `reviewed = true` are evaluated by
+  `--discover` and loaded by the scanner. Unreviewed tokens are printed and skipped.
+- Target Token Edit (cbETH): Replaced with cited Coinbase Arbitrum One contract
+  (0x1DEBd73E752bEaF79865Fd6446b0c970EaE7732f), retaining `reviewed = false`.
+- Automated `--discover` engine: queries UniV3 & PancakeV3 factories across all
+  enabled fee tiers, filters for WETH depth >= MIN_POOL_WETH (default 10 WETH),
+  requires >= 2 distinct venue/tier combinations, measures single-leg price impact
+  ladder at 0.05, 0.25, and 1.00 WETH, selects 3 trade sizes per market with impact
+  <= 3 bps (capped at 5 WETH), writes `data/markets.json`, and prints summary tables.
+- Market fallback: scanner loads from `data/markets.json`, filtering for reviewed tokens.
+- Chunked Multicall3: splits batches into chunks (size 40) so eth_call payloads
+  stay well within provider limits. Reports call counts and largest gas estimate.
+- Reference ETH/USD pricing: JSONL logs include `est_gross_profit_usd` based on
+  the block-pinned WETH/USDC UniV3-500 quote.
+- Summarizer upgrades: configurable `--usd-min` (default 0.01), screening rows with
+  spread > 0 and USD >= usd_min. Header explicitly documents fixed trade sizes.
+- Persistence view: tracks longest run of consecutive sampled blocks with spread > 0,
+  and with spread > -1 bps.
+- Proxy audit: computes EIP-1967 beacon slot from spec (`keccak256("eip1967.proxy.beacon") - 1`),
+  identifying beacon proxies and resolving implementation addresses.
+- Bounded test execution: live run ended on its own (`timeout 180`) and logged
+  to temporary output file `data/live_test_phase2f_fixes.jsonl`.
+
+--------------------------------------------------------------------------------
+2. TOKEN ALLOWLIST & REVIEWED FLAGS VERIFICATION
+--------------------------------------------------------------------------------
+Tokens in `bot/tokens.toml` at Start and End of work:
+
+Reviewed Flags at Start:
+  reviewed = true (23 tokens):
+    USDC, WBTC, USDT, ARB, wstETH, USDC.e, DAI, LINK, UNI, GMX, AAVE,
+    PENDLE, RDNT, rETH, FRAX, MAGIC, LUSD, CRV, weETH, ezETH, sUSDe, GRAIL, PEPE.
+  reviewed = false (2 tokens):
+    cbETH, USDe.
+
+Reviewed Flags at End (Identical, Verified via Compare-Object):
+  reviewed = true (23 tokens):
+    USDC, WBTC, USDT, ARB, wstETH, USDC.e, DAI, LINK, UNI, GMX, AAVE,
+    PENDLE, RDNT, rETH, FRAX, MAGIC, LUSD, CRV, weETH, ezETH, sUSDe, GRAIL, PEPE.
+  reviewed = false (2 tokens):
+    cbETH, USDe.
+
+Diff check between tokens.toml.bak and tokens.toml:
+  Only cbETH address and source_url were updated to the verified Coinbase contract.
+  Zero reviewed flags were modified.
+
+--------------------------------------------------------------------------------
+3. PROXY ARCHITECTURE & BEACON AUDIT (Fix 4 & 5)
+--------------------------------------------------------------------------------
+EIP-1967 Slot Computation (per EIP-1967 specification):
+- Implementation slot: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
+  = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+- Admin slot: bytes32(uint256(keccak256("eip1967.proxy.admin")) - 1)
+  = 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103
+- Beacon slot: bytes32(uint256(keccak256("eip1967.proxy.beacon")) - 1)
+  = 0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50
+
+Audit of 760-Byte Bytecode Tokens:
+Tokens on Arbitrum One sharing 760 bytes:
+  WBTC, LINK, UNI, AAVE, PENDLE, rETH, MAGIC, LUSD, CRV, cbETH, weETH.
+Findings:
+- All 11 tokens are EIP-1967 Beacon Proxies!
+- Beacon contract address: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333 (Arbitrum Beacon)
+- Underlying Implementation address: 0x3f770ac673856f105b586bb393d122721265ad46 (StandardArbERC20 logic)
+- Standard Arbitrum ERC20 Gateway bridged tokens with l1Address() hook.
+
+Other Proxies:
+- USDT: EIP-1967 Proxy (Impl: 0x3263cd783823d04a6b9819517e0e6840d37ca3f4, Admin: 0x553ec478a66be27ba25a6bc5db20aec2ed6a1b4a)
+- ARB: EIP-1967 Proxy (Impl: 0xd47d14a315394ddf063174f2286ab4eb7c507fa0, Admin: 0xdb216562328215e010f819b5abe947bad4ca961e)
+- wstETH: EIP-1967 Proxy (Impl: 0x0fbcbaea96ce0cf7ee00a8c19c3ab6f5dc8e1921, Admin: 0x1dca41859cd23b526cbe74da8f48ac96e14b1a29)
+- USDC.e: EIP-1967 Proxy (Impl: 0x1efb3f88bc88f03fd1804a5c53b7141bbef5ded8, Admin: 0xd570ace65c43af47101fc6250fd6fc63d1c22a86)
+- ezETH: EIP-1967 Proxy (Impl: 0xb370a0bd64daf1c6b04eaf01c1dedf7c6bce30f7, Admin: 0xba8efd0b58b93e49e120db8cf5578f6c43c3614d)
+
+Security Note on Transfer Fee Detection:
+Static 4-byte selector inspection detects standard fee functions (e.g., taxFee(), transferTax(),
+feePercent()), but contracts that implement fees directly inside transfer() or _transfer()
+without public fee getters cannot be detected statically.
+Tokens requiring an Arbitrum fork transfer test before any capital execution:
+- PEPE (custom meme token contracts often embed tax / transfer restrictions)
+- RDNT (complex lending / lock token with transfer hooks)
+- Any non-gateway custom token implementations.
+
+--------------------------------------------------------------------------------
+4. DISCOVERY AUDIT TABLE & FINAL MARKETS (Fix 1)
+--------------------------------------------------------------------------------
+On-Chain Audit Table:
+Symbol   Contract Address                           Dec   Status     Risk Flags               Reviewed   Bytecode    
+-------------------------------------------------------------------------------------------------------------------
+USDC     0xaf88d065e77c8cC2239327C5EDb3A432268e5831 6     VERIFIED   [PAUSE, BLACKLIST]       YES        1852 bytes  
+WBTC     0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f 8     VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+USDT     0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9 6     VERIFIED   [PROXY]                  YES        2141 bytes  
+   └── Architecture: EIP1967Proxy (Impl: 0x3263cd783823d04a6b9819517e0e6840d37ca3f4, Admin: 0x553ec478a66be27ba25a6bc5db20aec2ed6a1b4a)
+ARB      0x912CE59144191C1204E64559FE8253a0e49E6548 18    VERIFIED   [PROXY, ARB_GATEWAY]     YES        2593 bytes  
+   └── Architecture: EIP1967Proxy (Impl: 0xd47d14a315394ddf063174f2286ab4eb7c507fa0, Admin: 0xdb216562328215e010f819b5abe947bad4ca961e)
+wstETH   0x5979D7b546E38E414F7E9822514be443A4800529 18    VERIFIED   [PROXY]                  YES        3296 bytes  
+   └── Architecture: EIP1967Proxy (Impl: 0x0fbcbaea96ce0cf7ee00a8c19c3ab6f5dc8e1921, Admin: 0x1dca41859cd23b526cbe74da8f48ac96e14b1a29)
+USDC.e   0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8 6     VERIFIED   [PROXY, ARB_GATEWAY, PAUSE, BLACKLIST] YES        2092 bytes  
+   └── Architecture: EIP1967Proxy (Impl: 0x1efb3f88bc88f03fd1804a5c53b7141bbef5ded8, Admin: 0xd570ace65c43af47101fc6250fd6fc63d1c22a86)
+DAI      0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1 18    VERIFIED   [NONE]                   YES        4926 bytes  
+LINK     0xf97f4df75117a78c1A5a0DBb814Af92458539FB4 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+UNI      0xFa7F8980b0f1E64A2062791cc3b0871572f1f7f0 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+GMX      0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a 18    VERIFIED   [NONE]                   YES        8613 bytes  
+AAVE     0xba5DdD1f9d7F570dc94a51479a000E3BCE967196 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+PENDLE   0x0c880f6761f1af8d9aa9c466984b80dab9a8c9e8 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+RDNT     0x3082CC23568eA640225c2467653dB90e9250AaA0 18    VERIFIED   [PAUSE]                  YES        19392 bytes 
+rETH     0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+FRAX     0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F 18    VERIFIED   [NONE]                   YES        15993 bytes 
+MAGIC    0x539bdE0d7Dbd336b79148AA742883198BBF60342 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+LUSD     0x93b346b6bc2548da6a1e7d98e9a421b42541425b 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+CRV      0x11cDB42B0EB46D95F990BeDD4695A6e3fA034978 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+cbETH    0x1DEBd73E752bEaF79865Fd6446b0c970EaE7732f 18    VERIFIED   [BEACON, ARB_GATEWAY]    NO (pending) 760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+weETH    0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe 18    VERIFIED   [BEACON, ARB_GATEWAY]    YES        760 bytes   
+   └── Architecture: BeaconProxy (Beacon: 0xe72ba9418b5f2ce0a6a40501fe77c6839aa37333, Impl: 0x3f770ac673856f105b586bb393d122721265ad46)
+ezETH    0x2416092f143378750bb29b79eD961ab195CcEea5 18    VERIFIED   [PROXY]                  YES        2188 bytes  
+   └── Architecture: EIP1967Proxy (Impl: 0xb370a0bd64daf1c6b04eaf01c1dedf7c6bce30f7, Admin: 0xba8efd0b58b93e49e120db8cf5578f6c43c3614d)
+USDe     0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34 18    VERIFIED   [NONE]                   NO (pending) 13886 bytes 
+sUSDe    0x211cc4dd073734da055fbf44a2b4667d5e5fe5d2 18    VERIFIED   [NONE]                   YES        15007 bytes 
+GRAIL    0x3d9907f9a368ad0a51be60f7da3b97cf940982d8 18    VERIFIED   [NONE]                   YES        9299 bytes  
+PEPE     0x25d887Ce7a35172C62FeBFD67a1856F20FaEbB00 18    VERIFIED   [NONE]                   YES        18324 bytes 
+-------------------------------------------------------------------------------------------------------------------
+
+Skipped Unreviewed Tokens (reviewed = false):
+  - cbETH    (0x1DEBd73E752bEaF79865Fd6446b0c970EaE7732f) [on-chain verified: true]
+  - USDe     (0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34) [on-chain verified: true]
+
+Discovered Markets in data/markets.json (All reviewed = true):
+-------------------------------------------------------------------------------------------------------------------
+Pair         Quote Token                                Venues                           Trade Sizes (WETH)
+-------------------------------------------------------------------------------------------------------------------
+WETH/USDC    0xaf88d065e77c8cC2239327C5EDb3A432268e5831 UniV3-100/500/3000/10000, Pancake-100/500 [0.01, 0.05, 0.1]
+WETH/WBTC    0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f UniV3-500/3000, Pancake-100      [0.01, 0.1, 0.5]
+WETH/USDT    0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9 UniV3-500/3000, Pancake-100/500  [0.01, 0.02, 0.05]
+WETH/ARB     0x912CE59144191C1204E64559FE8253a0e49E6548 UniV3-500/3000/10000            [0.01, 0.05, 0.1]
+WETH/USDC.e  0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8 UniV3-500/3000                  [0.02, 0.05, 0.1]
+WETH/LINK    0xf97f4df75117a78c1A5a0DBb814Af92458539FB4 UniV3-500/3000                  [0.01, 0.05, 0.1]
+WETH/GMX     0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a UniV3-3000/10000                [0.02, 0.05, 0.1]
+WETH/AAVE    0xba5DdD1f9d7F570dc94a51479a000E3BCE967196 UniV3-3000, Pancake-500          [0.02, 0.05, 0.1]
+WETH/PENDLE  0x0c880f6761f1af8d9aa9c466984b80dab9a8c9e8 UniV3-500/3000                  [0.02, 0.05, 0.1]
+
+Confirming: 100% of quote tokens in data/markets.json have reviewed = true.
+
+--------------------------------------------------------------------------------
+5. RPC CALL COUNT & COMPUTE UNITS METRICS (Fix 6)
+--------------------------------------------------------------------------------
+Per Processed Block:
+- Batch 1 (State reads + 1st leg quotes): 106 calls chunked at 40 -> 3 RPC calls (29,668 bytes calldata)
+- Batch 2 (2nd leg quotes across all venue pairs): 192 calls chunked at 40 -> 5 RPC calls (61,508 bytes calldata)
+- Total eth_call RPC calls per processed block = 8 RPC calls.
+
+Compute Units & Daily Estimation at LOG_EVERY_N_BLOCKS = 40:
+- Arbitrum block production rate: ~4 blocks / sec (~0.25s block time).
+- Total blocks per 24 hours: 86,400 / 0.25 = 345,600 blocks / day.
+- Processed blocks per day (at sample rate 40): 345,600 / 40 = 8,640 processed blocks / day.
+- Total eth_call RPC calls per day: 8,640 * 8 = 69,120 RPC calls / day.
+- Compute Units (CU) estimate:
+  Standard eth_call costs 26 CUs on Alchemy:
+  69,120 * 26 = 1,797,120 CUs / day (~1.80M CUs/day).
+  On Alchemy's free tier of 300M CUs/month (~10M CUs/day), this consumes only ~18% of the free tier.
+
+--------------------------------------------------------------------------------
+6. BOUNDED LIVE TEST & SUMMARIZER RANKINGS (Fix 2 & 3)
+--------------------------------------------------------------------------------
+Test Execution:
+- Window: 180 seconds bounded execution
+- Output file: data/live_test_phase2f_fixes.jsonl (temporary file)
+- Total rows logged: 3,072 rows
+- Distinct sampled blocks: 16 blocks (512208080 to 512208680)
+- Records per block: 192 records / block (9 markets across multiple venues & trade sizes)
+- Errors: 0 errors (data/live_test_stderr.log is 0 bytes)
+
+Summarizer Output (`cargo run --release --bin summarize -- data/live_test_phase2f_fixes.jsonl --top 10 --usd-min 0.01`):
+
+══ Opportunity Summary by Pair, Venue Pair, Direction & Size ══
+   (Note: est_gross_profit_usd is computed at fixed trade sizes)
+
+Total rows: 3072, Groups: 192, Rows with spread > 0: 0, Rows with USD >= $0.01: 0
+
+══ Top 10 Groups Ranked by Max Spread ══
+Rank Pair        Venue A      Venue B      Dir       Size(W)    Max(bps) Median(bps)     Spread > 0 USD >= $0.01
+--------------------------------------------------------------------------------------------------------------
+1    WETH/USDC   UniV3-100    Pancake-100  b_to_a      0.010       -0.08       -2.77       0 (0.0%)            0
+2    WETH/USDC   UniV3-100    Pancake-100  a_to_b      0.010       -0.79       -2.82       0 (0.0%)            0
+3    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.010       -1.72       -5.93       0 (0.0%)            0
+4    WETH/USDC   UniV3-100    Pancake-500  a_to_b      0.010       -2.25       -6.22       0 (0.0%)            0
+5    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.010       -2.30       -4.84       0 (0.0%)            0
+6    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.100       -2.31       -4.80       0 (0.0%)            0
+7    WETH/USDC   UniV3-100    UniV3-500    a_to_b      0.010       -2.66       -6.68       0 (0.0%)            0
+8    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.050       -2.67       -6.88       0 (0.0%)            0
+9    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.500       -2.92       -5.39       0 (0.0%)            0
+10   WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.010       -2.93       -6.31       0 (0.0%)            0
+
+══ Top 10 Groups Ranked by Count of Rows Above -2 bps ══
+Rank Pair        Venue A      Venue B      Dir       Size(W)    Rows > -2 bps    Max(bps)     Spread > 0 USD >= $0.01
+-------------------------------------------------------------------------------------------------------------------
+1    WETH/USDC   UniV3-100    Pancake-100  b_to_a      0.010        3 (18.8%)       -0.08       0 (0.0%)            0
+2    WETH/USDC   UniV3-100    Pancake-100  a_to_b      0.010        2 (12.5%)       -0.79       0 (0.0%)            0
+3    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.010         1 (6.2%)       -1.72       0 (0.0%)            0
+4    WETH/USDC   UniV3-100    Pancake-500  a_to_b      0.010         0 (0.0%)       -2.25       0 (0.0%)            0
+5    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.010         0 (0.0%)       -2.30       0 (0.0%)            0
+6    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.100         0 (0.0%)       -2.31       0 (0.0%)            0
+7    WETH/USDC   UniV3-100    UniV3-500    a_to_b      0.010         0 (0.0%)       -2.66       0 (0.0%)            0
+8    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.050         0 (0.0%)       -2.67       0 (0.0%)            0
+9    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.500         0 (0.0%)       -2.92       0 (0.0%)            0
+10   WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.010         0 (0.0%)       -2.93       0 (0.0%)            0
+
+══ Top 10 Groups Ranked by Persistence (Consecutive Blocks > -1 bps & > 0 bps) ══
+Rank Pair        Venue A      Venue B      Dir       Size(W)  Max Run (>-1 bps) Max Run (>0 bps)    Max(bps)    Rows
+-------------------------------------------------------------------------------------------------------------------
+1    WETH/USDC   UniV3-100    Pancake-100  b_to_a      0.010                  1                0       -0.08      16
+2    WETH/USDC   UniV3-100    Pancake-100  a_to_b      0.010                  1                0       -0.79      16
+3    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.010                  0                0       -1.72      16
+4    WETH/USDC   UniV3-100    Pancake-500  a_to_b      0.010                  0                0       -2.25      16
+5    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.010                  0                0       -2.30      16
+6    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.100                  0                0       -2.31      16
+7    WETH/USDC   UniV3-100    UniV3-500    a_to_b      0.010                  0                0       -2.66      16
+8    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.050                  0                0       -2.67      16
+9    WETH/WBTC   UniV3-500    Pancake-100  b_to_a      0.500                  0                0       -2.92      16
+10   WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.010                  0                0       -2.93      16
+
+Key Insight:
+WETH/USDC between UniV3-100 and Pancake-100 reached a peak spread of -0.08 bps (almost dead parity),
+with 18.8% of blocks above -2 bps and isolated single-block runs within -1 bps.
+
+--------------------------------------------------------------------------------
+7. VERIFICATION PIPELINE & BUILD ARTIFACTS
+--------------------------------------------------------------------------------
+Commands Executed & Verified:
+1. `cargo check`                                 --> Exit Code 0 (clean)
+2. `cargo clippy --all-targets -- -D warnings`   --> Exit Code 0 (0 warnings)
+3. `cargo test`                                  --> Exit Code 0 (30 passed; 0 failed)
+   - test pricing::sushi_v2::tests::cpf_weth_to_usdc_small_trade ... ok
+   - test pricing::sushi_v2::tests::cpf_zero_inputs_return_zero ... ok
+   - test pricing::sushi_v2::tests::cpf_symmetric_sanity ... ok
+   - test pricing::tests::usd_price_respects_decimals ... ok
+   - test config::tests::test_market_config_defaults ... ok
+   - test pricing::tests::decimals_round_trip ... ok
+   - test provider::tests::leaves_plain_text_untouched ... ok
+   - test config::tests::parse_default_venues ... ok
+   - test strategy::tests::quoter_call_count_formula ... ok
+   - test strategy::tests::spread_negative_when_loss ... ok
+   - test strategy::tests::spread_positive_when_profit ... ok
+   - test provider::tests::redacts_http_and_ws_urls ... ok
+   - test strategy::tests::spread_zero_when_equal ... ok
+   - test strategy::tests::spread_zero_when_weth_in_is_zero ... ok
+   - test strategy::tests::records_are_canonical_and_sorted ... ok
+   - test strategy::tests::sushi_round_trip_loses_about_two_fees ... ok
+   - test strategy::tests::v2_liquidity_is_sqrt_k ... ok
+   - test strategy::tests::venue_from_str_and_display ... ok
+   - test summary::tests::test_median_odd_and_even ... ok
+   - test summary::tests::test_percentile_95 ... ok
+   - test summary::tests::test_summarize_fixture ... ok
+   - test summary::tests::test_summarize_multi_pair_and_legacy_rows ... ok
+   - test summary::tests::test_persistence_runs_with_fixture ... ok
+   - test tokens::tests::test_unreviewed_token_never_reaches_markets_json ... ok
+   - test tokens::tests::test_compute_eip1967_slots ... ok
+   - test strategy::tests::test_reopening_output_file_appends ... ok
+   - test watchdog::tests::test_watchdog_trips_when_no_blocks_after_arm ... ok
+   - test watchdog::tests::test_watchdog_unarmed_does_not_trip ... ok
+   - test watchdog::tests::test_watchdog_resets_on_processed_block ... ok
+   - test tokens::tests::test_cbeth_onchain_verification ... ok
+4. `cargo build --release`                       --> Exit Code 0 (clean release binary)
+
+================================================================================
+END OF PHASE 2f REPORT
+================================================================================

@@ -36,11 +36,30 @@ const MAX_CONCURRENT_RPC: usize = 8;
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// A pricing venue on the WETH/USDC pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Venue {
     UniswapV3 { fee: u32 },
     PancakeV3 { fee: u32 },
     SushiV2,
+}
+
+impl serde::Serialize for Venue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Venue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<Venue>().map_err(serde::de::Error::custom)
+    }
 }
 
 impl std::fmt::Display for Venue {
@@ -193,6 +212,9 @@ pub struct OpportunityRecord {
     pub mid_amount: String,
     /// Gross spread in basis points (may be negative).
     pub gross_spread_bps: f64,
+    /// Estimated gross profit in USD = (weth_out - weth_in) in WETH * ETH/USD price from WETH/USDC UniV3-500.
+    #[serde(default)]
+    pub est_gross_profit_usd: f64,
     /// Depth of venue_a in V3 `L` units, as a JSON string for precision.
     pub pool_liquidity_a: String,
     /// Depth of venue_b in V3 `L` units, as a JSON string for precision.
@@ -245,9 +267,13 @@ pub struct BatchedBlockResult {
     pub trips: Vec<RoundTrip>,
     pub batch1_calls: usize,
     pub batch2_calls: usize,
+    pub batch1_rpc_calls: usize,
+    pub batch2_rpc_calls: usize,
+    pub total_rpc_calls: usize,
     pub batch1_payload_bytes: usize,
     pub batch2_payload_bytes: usize,
     pub max_gas_estimate: u64,
+    pub eth_usd_price: f64,
 }
 
 /// Estimate Multicall3 calldata size in bytes.
@@ -324,13 +350,38 @@ pub async fn process_block_batched<P: Provider>(
         }
     }
 
+    // Reference price quote: WETH -> USDC on UniV3-500 @ 1 WETH to determine ETH/USD price
+    let usdc_addr: Address = crate::constants::USDC.parse()?;
+    let uni_quoter_addr: Address = crate::constants::UNI_V3_QUOTER_V2.parse()?;
+    let ref_quote_call = uniswap_v3::build_quote_call(
+        uni_quoter_addr,
+        500,
+        weth_addr,
+        usdc_addr,
+        U256::from(1_000_000_000_000_000_000u128),
+    )?;
+    batch1.push(ref_quote_call);
+    let ref_quote_idx = batch1.len() - 1;
+
     let batch1_calls = batch1.len();
     let batch1_payload_bytes = estimate_multicall_payload_size(&batch1);
 
-    // Execute Batch 1 (RPC Call 1)
-    let res1 = multicall::aggregate3(http, batch1, block).await?;
+    // Execute Batch 1 in chunks staying within provider limits
+    let (res1, batch1_rpc_calls) = multicall::aggregate3_chunked(
+        http,
+        batch1,
+        block,
+        multicall::DEFAULT_CHUNK_SIZE,
+    ).await?;
 
     let block_timestamp = multicall::decode_timestamp_result(&res1[0]).unwrap_or(0);
+
+    let eth_usd_price = if let Some((out, gas_est)) = uniswap_v3::decode_quote_result(&res1[ref_quote_idx]) {
+        max_gas_estimate = max_gas_estimate.max(gas_est);
+        out.to::<u128>() as f64 / 1e6
+    } else {
+        0.0
+    };
 
     let n_pools = all_pools.len();
     let mut v3_liq = Vec::with_capacity(n_pools);
@@ -453,10 +504,15 @@ pub async fn process_block_batched<P: Provider>(
     let batch2_calls = batch2.len();
     let batch2_payload_bytes = estimate_multicall_payload_size(&batch2);
 
-    if !batch2.is_empty() {
-        // Execute Batch 2 (RPC Call 2)
-        let res2 = multicall::aggregate3(http, batch2, block).await?;
-        for (res, (leg, venue_b)) in res2.iter().zip(batch2_meta) {
+    let (_res2, batch2_rpc_calls) = if !batch2.is_empty() {
+        // Execute Batch 2 in chunks
+        let (r2, rpc_cnt) = multicall::aggregate3_chunked(
+            http,
+            batch2,
+            block,
+            multicall::DEFAULT_CHUNK_SIZE,
+        ).await?;
+        for (res, (leg, venue_b)) in r2.iter().zip(batch2_meta) {
             if let Some((weth_back, gas_est)) = uniswap_v3::decode_quote_result(res) {
                 max_gas_estimate = max_gas_estimate.max(gas_est);
                 trips.push(RoundTrip {
@@ -472,7 +528,12 @@ pub async fn process_block_batched<P: Provider>(
                 });
             }
         }
-    }
+        (r2, rpc_cnt)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    let total_rpc_calls = batch1_rpc_calls + batch2_rpc_calls;
 
     Ok(BatchedBlockResult {
         block_timestamp,
@@ -481,9 +542,13 @@ pub async fn process_block_batched<P: Provider>(
         trips,
         batch1_calls,
         batch2_calls,
+        batch1_rpc_calls,
+        batch2_rpc_calls,
+        total_rpc_calls,
         batch1_payload_bytes,
         batch2_payload_bytes,
         max_gas_estimate,
+        eth_usd_price,
     })
 }
 
@@ -598,6 +663,7 @@ pub fn to_records(
     logged_at: u64,
     state: &MarketState,
     trips: &[RoundTrip],
+    eth_usd_price: f64,
 ) -> Vec<OpportunityRecord> {
     let order = state.venues();
     let rank = |v: Venue| order.iter().position(|&x| x == v).unwrap_or(usize::MAX);
@@ -623,6 +689,9 @@ pub fn to_records(
                 String::new()
             };
 
+            let profit_weth = (t.weth_back as f64 - t.weth_in as f64) / 1e18;
+            let est_gross_profit_usd = profit_weth * eth_usd_price;
+
             OpportunityRecord {
                 timestamp,
                 logged_at,
@@ -636,6 +705,7 @@ pub fn to_records(
                 usdc_mid,
                 mid_amount: mid_str,
                 gross_spread_bps: gross_spread_bps(t.weth_in, t.weth_back),
+                est_gross_profit_usd,
                 pool_liquidity_a: state.pool_liquidity(&t.pair, a).to_string(),
                 pool_liquidity_b: state.pool_liquidity(&t.pair, b).to_string(),
                 sushi_reserve_weth: if t.pair == "WETH/USDC" { sushi_reserve_weth.clone() } else { "0".into() },
@@ -788,7 +858,7 @@ mod tests {
                 weth_back: w - w / 100,
             },
         ];
-        let recs = to_records(1, 2, 3, &state, &trips);
+        let recs = to_records(1, 2, 3, &state, &trips, 2600.0);
         assert_eq!(recs.len(), 2);
         // Sorted best first.
         assert!(recs[0].gross_spread_bps > recs[1].gross_spread_bps);
@@ -833,6 +903,7 @@ mod tests {
             usdc_mid: "26912378".into(),
             mid_amount: "26912378".into(),
             gross_spread_bps: -33.5,
+            est_gross_profit_usd: -0.08,
             pool_liquidity_a: "1000".into(),
             pool_liquidity_b: "2000".into(),
             sushi_reserve_weth: "3000".into(),

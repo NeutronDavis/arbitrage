@@ -9,11 +9,13 @@
 
 use alloy::primitives::Address;
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use crate::constants::{USDC, USDT, WBTC};
 use crate::strategy::Venue;
 
 /// Configuration for a specific WETH/token market.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketConfig {
     /// Token symbol, e.g. "USDC", "WBTC", "USDT".
     pub symbol: String,
@@ -134,68 +136,46 @@ impl Config {
             _ => None,
         };
 
-        // Active markets (default: "USDC,WBTC,USDT")
-        let markets_str = std::env::var("MARKETS")
-            .unwrap_or_else(|_| "USDC,WBTC,USDT".into());
+        let markets_file = std::env::var("MARKETS_FILE")
+            .unwrap_or_else(|_| "data/markets.json".into());
 
-        let mut markets = Vec::new();
-        for m_sym in markets_str.split(',') {
-            let sym = m_sym.trim().to_ascii_uppercase();
-            if sym.is_empty() {
-                continue;
+        let markets = if let Ok(markets_str) = std::env::var("MARKETS") {
+            parse_markets_string(&markets_str, custom_usdc_venues, custom_usdc_sizes)?
+        } else if Path::new(&markets_file).exists() {
+            let file = std::fs::File::open(&markets_file)
+                .with_context(|| format!("Failed to open markets file {}", markets_file))?;
+            let loaded: Vec<MarketConfig> = serde_json::from_reader(file)
+                .with_context(|| format!("Failed to parse JSON from {}", markets_file))?;
+            if loaded.is_empty() {
+                fallback_three_markets(custom_usdc_venues, custom_usdc_sizes)?
+            } else {
+                loaded
             }
-            match sym.as_str() {
-                "USDC" => {
-                    let venues = custom_usdc_venues.clone().unwrap_or_else(|| vec![
-                        Venue::UniswapV3 { fee: 500 },
-                        Venue::PancakeV3 { fee: 100 },
-                        Venue::PancakeV3 { fee: 500 },
-                    ]);
-                    let trade_sizes_weth = custom_usdc_sizes.clone().unwrap_or_else(|| vec![0.05, 0.1, 0.25, 0.5]);
-                    markets.push(MarketConfig {
-                        symbol: "USDC".into(),
-                        pair: "WETH/USDC".into(),
-                        quote_token: USDC.parse()?,
-                        quote_decimals: 6,
-                        venues,
-                        trade_sizes_weth,
-                    });
-                }
-                "WBTC" => {
-                    markets.push(MarketConfig {
-                        symbol: "WBTC".into(),
-                        pair: "WETH/WBTC".into(),
-                        quote_token: WBTC.parse()?,
-                        quote_decimals: 8,
-                        venues: vec![
-                            Venue::UniswapV3 { fee: 500 },
-                            Venue::PancakeV3 { fee: 100 },
-                        ],
-                        trade_sizes_weth: vec![0.1, 0.5, 1.0, 2.0],
-                    });
-                }
-                "USDT" => {
-                    markets.push(MarketConfig {
-                        symbol: "USDT".into(),
-                        pair: "WETH/USDT".into(),
-                        quote_token: USDT.parse()?,
-                        quote_decimals: 6,
-                        venues: vec![
-                            Venue::UniswapV3 { fee: 500 },
-                            Venue::PancakeV3 { fee: 100 },
-                            Venue::PancakeV3 { fee: 500 },
-                        ],
-                        trade_sizes_weth: vec![0.05, 0.1, 0.25],
-                    });
-                }
-                other => {
-                    anyhow::bail!("Unsupported market '{other}'. Supported markets are USDC, WBTC, USDT");
+        } else {
+            fallback_three_markets(custom_usdc_venues, custom_usdc_sizes)?
+        };
+
+        // Enforce the allowlist: the scanner must use only tokens with reviewed = true.
+        let markets = if let Ok(tokens_cfg) = crate::tokens::TokensConfig::load_default() {
+            let mut reviewed_markets = Vec::new();
+            for m in markets {
+                if tokens_cfg.is_reviewed(&m.quote_token) {
+                    reviewed_markets.push(m);
+                } else {
+                    tracing::warn!(
+                        symbol = %m.symbol,
+                        address = %m.quote_token,
+                        "Skipping market in scanner because token is unreviewed (reviewed = false)"
+                    );
                 }
             }
-        }
+            reviewed_markets
+        } else {
+            markets
+        };
 
         if markets.is_empty() {
-            return Err(anyhow!("MARKETS cannot be empty"));
+            return Err(anyhow!("No active reviewed markets configured"));
         }
 
         let output_file = std::env::var("OUTPUT_FILE")
@@ -222,6 +202,117 @@ impl Config {
             watchdog_secs,
         })
     }
+}
+
+pub fn fallback_three_markets(
+    custom_usdc_venues: Option<Vec<Venue>>,
+    custom_usdc_sizes: Option<Vec<f64>>,
+) -> Result<Vec<MarketConfig>> {
+    let mut markets = Vec::new();
+    let venues = custom_usdc_venues.unwrap_or_else(|| vec![
+        Venue::UniswapV3 { fee: 500 },
+        Venue::PancakeV3 { fee: 100 },
+        Venue::PancakeV3 { fee: 500 },
+    ]);
+    let trade_sizes_weth = custom_usdc_sizes.unwrap_or_else(|| vec![0.05, 0.1, 0.25, 0.5]);
+    markets.push(MarketConfig {
+        symbol: "USDC".into(),
+        pair: "WETH/USDC".into(),
+        quote_token: USDC.parse()?,
+        quote_decimals: 6,
+        venues,
+        trade_sizes_weth,
+    });
+    markets.push(MarketConfig {
+        symbol: "WBTC".into(),
+        pair: "WETH/WBTC".into(),
+        quote_token: WBTC.parse()?,
+        quote_decimals: 8,
+        venues: vec![
+            Venue::UniswapV3 { fee: 500 },
+            Venue::PancakeV3 { fee: 100 },
+        ],
+        trade_sizes_weth: vec![0.1, 0.5, 1.0, 2.0],
+    });
+    markets.push(MarketConfig {
+        symbol: "USDT".into(),
+        pair: "WETH/USDT".into(),
+        quote_token: USDT.parse()?,
+        quote_decimals: 6,
+        venues: vec![
+            Venue::UniswapV3 { fee: 500 },
+            Venue::PancakeV3 { fee: 100 },
+            Venue::PancakeV3 { fee: 500 },
+        ],
+        trade_sizes_weth: vec![0.05, 0.1, 0.25],
+    });
+    Ok(markets)
+}
+
+pub fn parse_markets_string(
+    markets_str: &str,
+    custom_usdc_venues: Option<Vec<Venue>>,
+    custom_usdc_sizes: Option<Vec<f64>>,
+) -> Result<Vec<MarketConfig>> {
+    let mut markets = Vec::new();
+    for m_sym in markets_str.split(',') {
+        let sym = m_sym.trim().to_ascii_uppercase();
+        if sym.is_empty() {
+            continue;
+        }
+        match sym.as_str() {
+            "USDC" => {
+                let venues = custom_usdc_venues.clone().unwrap_or_else(|| vec![
+                    Venue::UniswapV3 { fee: 500 },
+                    Venue::PancakeV3 { fee: 100 },
+                    Venue::PancakeV3 { fee: 500 },
+                ]);
+                let trade_sizes_weth = custom_usdc_sizes.clone().unwrap_or_else(|| vec![0.05, 0.1, 0.25, 0.5]);
+                markets.push(MarketConfig {
+                    symbol: "USDC".into(),
+                    pair: "WETH/USDC".into(),
+                    quote_token: USDC.parse()?,
+                    quote_decimals: 6,
+                    venues,
+                    trade_sizes_weth,
+                });
+            }
+            "WBTC" => {
+                markets.push(MarketConfig {
+                    symbol: "WBTC".into(),
+                    pair: "WETH/WBTC".into(),
+                    quote_token: WBTC.parse()?,
+                    quote_decimals: 8,
+                    venues: vec![
+                        Venue::UniswapV3 { fee: 500 },
+                        Venue::PancakeV3 { fee: 100 },
+                    ],
+                    trade_sizes_weth: vec![0.1, 0.5, 1.0, 2.0],
+                });
+            }
+            "USDT" => {
+                markets.push(MarketConfig {
+                    symbol: "USDT".into(),
+                    pair: "WETH/USDT".into(),
+                    quote_token: USDT.parse()?,
+                    quote_decimals: 6,
+                    venues: vec![
+                        Venue::UniswapV3 { fee: 500 },
+                        Venue::PancakeV3 { fee: 100 },
+                        Venue::PancakeV3 { fee: 500 },
+                    ],
+                    trade_sizes_weth: vec![0.05, 0.1, 0.25],
+                });
+            }
+            other => {
+                anyhow::bail!("Unsupported market '{other}'. Supported markets are USDC, WBTC, USDT");
+            }
+        }
+    }
+    if markets.is_empty() {
+        return Err(anyhow!("MARKETS cannot be empty"));
+    }
+    Ok(markets)
 }
 
 #[cfg(test)]
