@@ -12,8 +12,10 @@ use tracing::info;
 
 use crate::config::MarketConfig;
 use crate::constants::{
-    PANCAKE_V3_FACTORY, PANCAKE_V3_QUOTER_V2, UNI_V3_FACTORY, UNI_V3_QUOTER_V2, WETH,
+    CAMELOT_V3_FACTORY, CAMELOT_V3_QUOTER, PANCAKE_V3_FACTORY, PANCAKE_V3_QUOTER_V2,
+    UNI_V3_FACTORY, UNI_V3_QUOTER_V2, WETH,
 };
+use crate::pricing::camelot_v3::IAlgebraFactory;
 use crate::pricing::uniswap_v3::{IQuoterV2, IUniswapV3Factory, IERC20};
 use crate::pricing::weth_to_raw;
 use crate::strategy::Venue;
@@ -140,10 +142,13 @@ pub async fn run_discovery<P: Provider>(
     let uni_quoter_addr: Address = UNI_V3_QUOTER_V2.parse()?;
     let pancake_factory_addr: Address = PANCAKE_V3_FACTORY.parse()?;
     let pancake_quoter_addr: Address = PANCAKE_V3_QUOTER_V2.parse()?;
+    let camelot_factory_addr: Address = CAMELOT_V3_FACTORY.parse()?;
+    let camelot_quoter_addr: Address = CAMELOT_V3_QUOTER.parse()?;
     let weth_addr: Address = WETH.parse()?;
 
     let uni_factory = IUniswapV3Factory::new(uni_factory_addr, http);
     let pancake_factory = IUniswapV3Factory::new(pancake_factory_addr, http);
+    let camelot_factory = IAlgebraFactory::new(camelot_factory_addr, http);
     let weth_token = IERC20::new(weth_addr, http);
 
     // Enabled fee tiers: UniV3 [100, 500, 3000, 10000]; PancakeV3 [100, 500, 2500, 10000]
@@ -224,12 +229,29 @@ pub async fn run_discovery<P: Provider>(
             }
         }
 
+        // 3. Check Camelot V3 (Algebra)
+        if let Ok(pool_addr) = camelot_factory.poolByPair(weth_addr, token_addr).call().await {
+            if pool_addr != Address::ZERO {
+                if let Ok(bal) = weth_token.balanceOf(pool_addr).call().await {
+                    let bal_f64 = bal.to::<u128>() as f64 / 1e18;
+                    if bal >= min_balance_raw {
+                        candidate_pools.push((Venue::CamelotV3, 0, pool_addr, camelot_quoter_addr, bal, bal_f64));
+                    } else {
+                        println!(
+                            "{:<12} {:<42} {:>12.2} {:>14} {:>14} {:>10}",
+                            "Camelot-dyn", pool_addr, bal_f64, "-", "-", "SHALLOW"
+                        );
+                    }
+                }
+            }
+        }
+
         // Measure price impact on candidate pools
         let mut measured_pools = Vec::new();
         for (venue, fee, pool_addr, quoter_addr, bal, bal_f64) in candidate_pools {
-            let (imp_05, q05) = (0.0, quote_single(http, quoter_addr, weth_addr, token_addr, fee, 0.05).await);
-            let q25 = quote_single(http, quoter_addr, weth_addr, token_addr, fee, 0.25).await;
-            let q100 = quote_single(http, quoter_addr, weth_addr, token_addr, fee, 1.0).await;
+            let (imp_05, q05) = (0.0, quote_pool_single(http, quoter_addr, venue, fee, weth_addr, token_addr, 0.05).await);
+            let q25 = quote_pool_single(http, quoter_addr, venue, fee, weth_addr, token_addr, 0.25).await;
+            let q100 = quote_pool_single(http, quoter_addr, venue, fee, weth_addr, token_addr, 1.0).await;
 
             let imp_25 = match (q05, q25) {
                 (Some(out05), Some(out25)) => {
@@ -345,6 +367,32 @@ pub async fn run_discovery<P: Provider>(
     Ok((check_results, discovered_markets))
 }
 
+/// Helper to quote single leg across Uniswap V3, PancakeSwap V3, or Camelot V3.
+async fn quote_pool_single<P: Provider>(
+    http: &P,
+    quoter: Address,
+    venue: Venue,
+    fee: u32,
+    token_in: Address,
+    token_out: Address,
+    size_weth: f64,
+) -> Option<U256> {
+    match venue {
+        Venue::CamelotV3 => {
+            use alloy::primitives::U160;
+            use crate::pricing::camelot_v3::IAlgebraQuoter;
+            let q = IAlgebraQuoter::new(quoter, http);
+            let amount_in = U256::from(weth_to_raw(size_weth));
+            q.quoteExactInputSingle(token_in, token_out, amount_in, U160::ZERO)
+                .call()
+                .await
+                .ok()
+                .map(|r| r.amountOut)
+        }
+        _ => quote_single(http, quoter, token_in, token_out, fee, size_weth).await,
+    }
+}
+
 /// Helper to quote single leg from QuoterV2.
 async fn quote_single<P: Provider>(
     http: &P,
@@ -382,8 +430,8 @@ async fn select_trade_sizes_for_market<P: Provider>(
     for &size in &candidates {
         let mut all_pass = true;
         for p in pools {
-            let base_opt = quote_single(http, p.quoter_address, weth, token, p.fee, 0.05).await;
-            let current_opt = quote_single(http, p.quoter_address, weth, token, p.fee, size).await;
+            let base_opt = quote_pool_single(http, p.quoter_address, p.venue, p.fee, weth, token, 0.05).await;
+            let current_opt = quote_pool_single(http, p.quoter_address, p.venue, p.fee, weth, token, size).await;
             match (base_opt, current_opt) {
                 (Some(b), Some(c)) => {
                     let rate_base = b.to::<u128>() as f64 / 0.05;

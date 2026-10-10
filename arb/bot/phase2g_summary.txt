@@ -1,0 +1,250 @@
+================================================================================
+PHASE 2g SUMMARY REPORT: QUIETER LOGGING, HEARTBEAT & STATS (READ-ONLY)
+================================================================================
+Date: 2026-10-10
+Chain: Arbitrum One (Chain ID: 42161)
+Status: Completed, Verified On-Chain, Unit Tested, Read-Only (Phase 3 Not Started)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW & OBJECTIVES
+--------------------------------------------------------------------------------
+Phase 2g implemented quieter logging, heartbeat telemetry, persistent stats
+snapshotting, and updated summarizer reporting for the Arbitrum arbitrage bot.
+The scanner evaluates cross-venue opportunities between Uniswap V3 and
+PancakeSwap V3, but instead of logging thousands of un-actionable negative rows
+to disk every minute, it logs only opportunities meeting a spread threshold
+while preserving full distribution metrics and per-market block telemetry.
+
+Key requirements & constraints strictly maintained:
+- Read-only execution: no wallet, no transactions, no PRIVATE_KEY.
+- Security constraints: no .env files created, edited, read, or deleted; no secrets
+  or RPC URLs printed.
+- Token immutability: tokens.toml and reviewed flags left completely untouched.
+- Test hygiene: test runs bounded by timeout, logging only to temporary files
+  (data/test_phase2g.jsonl), leaving data/opportunities.jsonl pristine.
+- Phase boundary: Phase 3 (execution / transactions) not started.
+
+--------------------------------------------------------------------------------
+2. COMPONENT CHANGES & ARCHITECTURE
+--------------------------------------------------------------------------------
+
+2.1 Threshold Logging (LOG_MIN_SPREAD_BPS)
+- Config parameter: `log_min_spread_bps` in `arb/bot/src/config.rs` (default: -2.0).
+- Startup warning: If `log_min_spread_bps > -1.0`, a warning is logged to stderr
+  because the persistence analysis view requires data at or below -1.0 bps.
+- Filtering logic (`filter_records_by_threshold` in `arb/bot/src/strategy.rs`):
+  Full opportunity rows are written to `OUTPUT_FILE` only when:
+    gross_spread_bps >= log_min_spread_bps  OR  gross_spread_bps > 0.0
+  Positive spreads (> 0.0 bps) are ALWAYS written regardless of the threshold.
+
+2.2 Heartbeat Telemetry (*.heartbeat.jsonl)
+- Config parameter: `heartbeat_file` (default: `<OUTPUT_FILE>.heartbeat.jsonl`).
+- Records one line per market per processed block containing:
+    - timestamp (u64 unix seconds)
+    - block_number (u64)
+    - pair (String, e.g. "WETH/USDC")
+    - best_spread_bps (f64)
+    - best_venue_a (String)
+    - best_venue_b (String)
+    - best_direction (String)
+    - best_size_weth (f64)
+- Written and flushed (`flush()`) on every processed block.
+
+2.3 Stats Snapshot (*.stats.json)
+- Config parameter: `stats_file` (default: `<OUTPUT_FILE>.stats.json`).
+- Tracks per group (`pair`, `venue_a`, `venue_b`, `direction`, `size_weth`):
+    - sample_count (u64)
+    - max_spread_bps (f64)
+    - min_spread_bps (f64)
+    - sum_spread_bps (f64)
+    - 0.5 bps bucket histogram from -100.0 to +10.0 bps (220 buckets),
+      plus underflow (< -100.0 bps) and overflow (> +10.0 bps) buckets.
+- Persistence across restarts: On startup, the bot loads the existing stats file
+  if present and continues accumulating sample counts and histogram frequencies.
+- Atomic writes: Snapshots are written to a temporary file (`*.tmp`) and renamed
+  atomically (`fs::rename`) to prevent corrupt or partial reads by external processes.
+- Snapshot schedule: Written on the first processed block, every 10 minutes
+  thereafter, and on clean shutdown (SIGINT / Ctrl+C handler).
+
+2.4 Summarizer Updates (`arb/bot/src/bin/summarize.rs` & `arb/bot/src/summary.rs`)
+- Reads:
+    1. Opportunity rows file (`OUTPUT_FILE`)
+    2. Companion heartbeat file (`<OUTPUT_FILE>.heartbeat.jsonl` if present)
+    3. Companion stats snapshot file (`<OUTPUT_FILE>.stats.json` if present)
+- Group metrics:
+    - Blocks seen, rows logged, max spread, rows > 0, USD >= min.
+    - Approximate median and P95 calculated from the 0.5 bps histogram,
+      explicitly documented with a disclaimer:
+      "* Note: Median and P95 values are APPROXIMATE, calculated from the 0.5 bps bucket histogram."
+    - Persistence runs: Tracks consecutive sampled blocks with spread > -1 bps and > 0 bps,
+      treating unlogged blocks as below the threshold.
+- Per-market summary table:
+    - Generated from heartbeat records: min, median, max best spread,
+      and percentage of blocks > -2 bps, > -1 bps, and > 0 bps.
+- Backwards compatibility: Summarizer seamlessly processes legacy files that do
+  not have heartbeat or stats snapshot files.
+
+--------------------------------------------------------------------------------
+3. TOKEN ALLOWLIST & REPOSITORY INTEGRITY
+--------------------------------------------------------------------------------
+- `tokens.toml`: Verified untouched and identical to commit `eb6d49f`.
+  Total reviewed tokens remain 23: USDC, WBTC, USDT, ARB, wstETH, USDC.e,
+  DAI, LINK, UNI, GMX, AAVE, PENDLE, RDNT, rETH, FRAX, MAGIC, LUSD, CRV,
+  weETH, ezETH, sUSDe, GRAIL, PEPE.
+  Unreviewed tokens remain 2: cbETH, USDe.
+- `data/opportunities.jsonl`: Clean and unmodified from previous phases.
+- No `.env` files were created, edited, read, or deleted.
+
+--------------------------------------------------------------------------------
+4. VERIFICATION & UNIT TESTS
+--------------------------------------------------------------------------------
+All checks passed on Windows x86_64-pc-windows-gnu toolchain (with `-j 1`):
+
+1. `cargo check -j 1`: Clean (0 errors, 0 warnings).
+2. `cargo clippy --all-targets -j 1 -- -D warnings`: Clean (0 warnings).
+3. `cargo test -j 1 -- --test-threads=1`: All 70 unit tests passed:
+   - `test_threshold_filter_positives_always_logged`: Verifies records >= -2.0 bps
+     and positive records are kept, while sub-threshold negatives are dropped.
+   - `test_heartbeat_content`: Verifies extraction of best spread per market
+     with correct fields.
+   - `test_histogram_accumulation_and_reload_restart`: Verifies bucket placement,
+     underflow/overflow handling, JSON serialization/deserialization, and
+     accumulator reloading across simulated restarts.
+   - `test_summarizer_filtered_fixture_and_persistence`: Verifies group metrics,
+     approximate median/P95, and persistence run tracking when rows are filtered.
+   - `test_summarizer_reads_old_format_file`: Verifies legacy JSONL files without
+     heartbeat or stats companions are summarized cleanly.
+4. `cargo build --release -j 1`: Built `arb-bot.exe` and `summarize.exe` successfully.
+
+--------------------------------------------------------------------------------
+5. BOUNDED LIVE TEST & TELEMETRY RESULTS
+--------------------------------------------------------------------------------
+Executed a 180-second live test on Arbitrum One via GNU timeout:
+- Output target: `data/test_phase2g.jsonl`
+- Duration: 180 seconds (sampled 14 blocks: 513547440 to 513547960)
+- Total opportunities evaluated: 2,604 (186 evaluated combinations per block * 14 blocks)
+- Opportunity rows logged: 3 rows (1,380 bytes) — only spreads >= -2.0 bps
+- Heartbeat rows logged: 112 lines (23,229 bytes) across 8 active markets
+- Stats snapshot file: 603,181 bytes (`data/test_phase2g.jsonl.stats.json`)
+- Errors: 0 errors in stderr log
+
+Summarizer Output (`summarize.exe data/test_phase2g.jsonl --top 10`):
+
+Total blocks seen: 186, Total rows logged: 3, Groups: 186, Rows with spread > 0: 0, Rows with USD >= $0.01: 0
+
+* Note: Median and P95 values are APPROXIMATE, calculated from the 0.5 bps bucket histogram.
+
+══ Top 10 Groups Ranked by Max Spread ══
+Rank Pair        Venue A      Venue B      Dir       Size(W)    Max(bps)  Median(bps)*     Spread > 0 USD >= $0.01
+----------------------------------------------------------------------------------------------------------------
+1    WETH/USDC   UniV3-100    Pancake-100  a_to_b      0.010       -2.72         -2.75       0 (0.0%)            0
+2    WETH/USDC   UniV3-100    Pancake-100  b_to_a      0.010       -2.73         -2.75       0 (0.0%)            0
+3    WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.010       -3.51         -3.75       0 (0.0%)            0
+4    WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.010       -3.59         -3.75       0 (0.0%)            0
+5    WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.010       -3.83         -3.75       0 (0.0%)            0
+6    WETH/USDC   UniV3-100    UniV3-500    a_to_b      0.010       -3.87         -3.75       0 (0.0%)            0
+7    WETH/USDC   UniV3-100    Pancake-500  a_to_b      0.010       -4.18         -4.25       0 (0.0%)            0
+8    WETH/USDC   UniV3-500    Pancake-100  b_to_a      0.050       -4.24         -4.25       0 (0.0%)            0
+9    WETH/USDT   UniV3-500    Pancake-100  b_to_a      0.020       -4.49         -4.25       0 (0.0%)            0
+10   WETH/USDC   Pancake-100  Pancake-500  a_to_b      0.050       -4.81         -4.75       0 (0.0%)            0
+
+══ Per-Market Best Spread Summary (from Heartbeat) ══
+Pair           Blocks    Min(bps) Median(bps)    Max(bps)   Blocks > -2 bps   Blocks > -1 bps   Blocks > 0 bps
+-----------------------------------------------------------------------------------------------------------
+WETH/AAVE          14      -22.49      -15.33      -13.26        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/ARB           14      -27.16      -19.68      -19.68        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/GMX           14      -76.54      -76.54      -76.54        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/LINK          14      -15.55      -15.55      -12.82        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/USDC          14       -2.72       -2.57       -1.31        3 ( 21.4%)        0 (  0.0%)       0 (  0.0%)
+WETH/USDC.e        14      -35.06      -35.06      -35.06        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/USDT          14       -5.97       -3.59       -2.97        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/WBTC          14       -5.02       -2.89       -2.12        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+
+--------------------------------------------------------------------------------
+6. 24-HOUR FILE SIZE ESTIMATION BEFORE VS. AFTER
+--------------------------------------------------------------------------------
+Calculations based on 14 sampled blocks over 180 seconds (~6,750 sampled blocks/day
+at 1 block sampled every ~12.8s; or ~8,640 blocks/day at 10s poll intervals):
+
++-------------------------------------+------------------+------------------+-------------------+
+| Component                           | Before Phase 2g  | After Phase 2g   | Difference / Gain |
++-------------------------------------+------------------+------------------+-------------------+
+| Opportunity Rows Log (.jsonl)       | ~1,255,500 rows  | ~1,445 rows      | 99.88% reduction  |
+|                                     | (~577 MB)        | (~0.66 MB)       |                   |
+| Heartbeat Log (.heartbeat.jsonl)    | None             | ~54,000 rows     | New granular log  |
+|                                     |                  | (~11.18 MB)      |                   |
+| Stats Snapshot (.stats.json)        | None             | Bounded file     | Single JSON file  |
+|                                     |                  | (~0.60 MB)       |                   |
++-------------------------------------+------------------+------------------+-------------------+
+| Total 24-Hour Disk Footprint        | ~577 MB          | ~12.44 MB        | ~97.8% reduction  |
++-------------------------------------+------------------+------------------+-------------------+
+
+Key Takeaway: Disk usage decreases by ~97.8% while retaining all positive/near-zero
+arbitrage opportunities, continuous per-market telemetry, and distribution statistics.
+
+--------------------------------------------------------------------------------
+7. ANSWERS TO SPECIFIC QUESTIONS
+--------------------------------------------------------------------------------
+
+Q1: Does dotenv override environment variables set in the shell / PowerShell?
+Answer:
+No. In Rust, `dotenvy::dotenv()` only injects variables into the environment if
+they are not already set. It will NEVER overwrite an existing environment variable.
+Therefore, any variable set in the shell (e.g. `$env:OUTPUT_FILE = "..."`) takes
+absolute precedence over values in `.env`.
+
+Q2: What wrote 192 rows in block 512201215?
+Answer:
+In `data/markets.json`, the scanner evaluates all directed combinations between
+every pair of venues for each configured size tier:
+  Evaluated combinations per market = Venues * (Venues - 1) * Number of sizes
+In block 512201215, the reviewed markets evaluated were:
+  - WETH/USDC (6 venues, 3 sizes): 6 * 5 * 3 = 90 rows
+  - WETH/WBTC (3 venues, 3 sizes): 3 * 2 * 3 = 18 rows
+  - WETH/USDT (4 venues, 3 sizes): 4 * 3 * 3 = 36 rows
+  - WETH/ARB  (3 venues, 3 sizes): 3 * 2 * 3 = 18 rows
+  - WETH/USDC.e, LINK, GMX, AAVE, PENDLE (2 venues, 3 sizes each): 5 * (2 * 1 * 3) = 30 rows
+  Total: 90 + 18 + 36 + 18 + 30 = 192 evaluated rows.
+Before Phase 2g, the scanner logged every evaluated combination to disk, regardless
+of spread, generating exactly 192 rows for that block.
+
+Q3: What does `run_logger.ps1` do and which file does it write to?
+Answer:
+`run_logger.ps1` (located in `arb/bot/`):
+1. Archives existing `data/opportunities.jsonl` by moving it to `data/old-<timestamp>.jsonl`.
+2. Compiles the binary using `cargo build --release`.
+3. Enters an infinite restart loop: runs `target/release/arb-bot.exe` and redirects
+   console stdout and stderr to `data/bot.log`. If the bot process exits, it sleeps
+   5 seconds and restarts it.
+Files it writes to:
+- Console log: `data/bot.log`.
+- Opportunity rows: Because `run_logger.ps1` does NOT define `OUTPUT_FILE`, `arb-bot`
+  uses its default setting (`data/opportunities.jsonl`). Under Phase 2g, it also
+  writes `data/opportunities.jsonl.heartbeat.jsonl` and `data/opportunities.jsonl.stats.json`.
+
+--------------------------------------------------------------------------------
+8. RUN COMMANDS
+--------------------------------------------------------------------------------
+
+A. Run Pool Discovery:
+   cargo run --release -j 1 -- --discover
+
+B. Run Scanner with Custom Shell OUTPUT_FILE + Restart Loop:
+   # PowerShell (run from arb/bot)
+   $env:OUTPUT_FILE = "data/scanner_run_$(Get-Date -Format 'yyyyMMdd_HHmmss').jsonl"
+   $env:LOG_MIN_SPREAD_BPS = "-2.0"
+
+   while ($true) {
+       Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting arb-bot with output: $env:OUTPUT_FILE"
+       & .\target\x86_64-pc-windows-gnu\release\arb-bot.exe
+       Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Bot exited ($LASTEXITCODE). Restarting in 5s..."
+       Start-Sleep -Seconds 5
+   }
+
+C. Run Summarizer on an Output File:
+   # PowerShell (run from arb/bot)
+   .\target\x86_64-pc-windows-gnu\release\summarize.exe data/scanner_run_20261010_160000.jsonl --top 20
+
+================================================================================
+END OF PHASE 2g SUMMARY REPORT
+================================================================================

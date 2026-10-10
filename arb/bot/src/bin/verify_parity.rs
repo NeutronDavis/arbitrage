@@ -20,11 +20,15 @@ async fn main() -> Result<()> {
 
     let mut market_setups = Vec::new();
     for m_cfg in &cfg.markets {
+        let mut venues = m_cfg.venues.clone();
+        if m_cfg.symbol == "USDC" && !venues.contains(&Venue::CamelotV3) {
+            venues.push(Venue::CamelotV3);
+        }
         let pools = uniswap_v3::discover_market_pools(
             &http,
             &m_cfg.pair,
             m_cfg.quote_token,
-            &m_cfg.venues,
+            &venues,
         )
         .await?;
 
@@ -93,6 +97,16 @@ async fn main() -> Result<()> {
         .await?
         .amountOut;
 
+    // (d) Camelot-dyn WETH -> USDC @ 0.01 WETH
+    let camelot_quoter: Address = arb_bot::constants::CAMELOT_V3_QUOTER.parse()?;
+    let camelot_in_raw = U256::from(weth_to_raw(0.01));
+    let direct_quote_camelot = arb_bot::pricing::camelot_v3::IAlgebraQuoter::new(camelot_quoter, &http)
+        .quoteExactInputSingle(weth_addr, arb_bot::constants::USDC.parse()?, camelot_in_raw, U160::ZERO)
+        .block(block)
+        .call()
+        .await?
+        .amountOut;
+
     // 2. Multicall3 batched calls (Batch 1 + Batch 2) across all markets
     let batched = strategy::process_block_batched(
         &http,
@@ -113,6 +127,13 @@ async fn main() -> Result<()> {
         .first
         .iter()
         .find(|l| l.pair == "WETH/USDT" && l.venue == Venue::PancakeV3 { fee: 500 } && (l.size_weth - 0.05).abs() < 1e-6)
+        .map(|l| U256::from(l.quote_out))
+        .unwrap_or(U256::ZERO);
+
+    let mc_quote_camelot = batched
+        .first
+        .iter()
+        .find(|l| l.pair == "WETH/USDC" && l.venue == Venue::CamelotV3 && (l.size_weth - 0.01).abs() < 1e-6)
         .map(|l| U256::from(l.quote_out))
         .unwrap_or(U256::ZERO);
 
@@ -146,18 +167,27 @@ async fn main() -> Result<()> {
         if direct_quote_usdt == mc_quote_usdt { "EXACT MATCH" } else { "MISMATCH" }
     );
 
+    // Value 4: Camelot-dyn USDC quote @ 0.01 WETH
+    println!(
+        "{:<36} {:<24} {:<24} {:<10}",
+        "4. Camelot-dyn USDC Quote (0.01W)",
+        direct_quote_camelot,
+        mc_quote_camelot,
+        if direct_quote_camelot == mc_quote_camelot { "EXACT MATCH" } else { "MISMATCH" }
+    );
+
     assert_eq!(direct_liq_wbtc_100, mc_liq_wbtc_100, "Pancake-100 WBTC liquidity mismatch");
     assert_eq!(direct_quote_wbtc, mc_quote_wbtc, "UniV3-500 WBTC quote mismatch");
     assert_eq!(direct_quote_usdt, mc_quote_usdt, "Pancake-500 USDT quote mismatch");
+    assert_eq!(direct_quote_camelot, mc_quote_camelot, "Camelot-dyn USDC quote mismatch");
 
-    println!("\nAll 3 values match exactly between direct and Multicall3 batched execution!\n");
-    println!("Pancake-100 WBTC pool address: {}", pancake_wbtc_100_pool.address);
+    println!("\nAll 4 values match exactly between direct and Multicall3 batched execution!\n");
     println!("Direct cast call check commands:");
     println!("  cast call --block {} {} \"liquidity()(uint128)\"", block_num, pancake_wbtc_100_pool.address);
     println!("  cast call --block {} {} \"quoteExactInputSingle((address,address,uint256,uint24,uint160))((uint256,uint160,uint32,uint256))\" \"({},{},{},500,0)\"",
         block_num, uni_quoter, weth_addr, wbtc_addr, wbtc_in_raw);
-    println!("  cast call --block {} {} \"quoteExactInputSingle((address,address,uint256,uint24,uint160))((uint256,uint160,uint32,uint256))\" \"({},{},{},500,0)\"",
-        block_num, pancake_quoter, weth_addr, usdt_addr, usdt_in_raw);
+    println!("  cast call --block {} {} \"quoteExactInputSingle(address,address,uint256,uint160)(uint256,uint16)\" {} {} {} 0",
+        block_num, camelot_quoter, weth_addr, arb_bot::constants::USDC, camelot_in_raw);
 
     Ok(())
 }

@@ -40,6 +40,7 @@ const MAX_CONCURRENT_RPC: usize = 8;
 pub enum Venue {
     UniswapV3 { fee: u32 },
     PancakeV3 { fee: u32 },
+    CamelotV3,
     SushiV2,
 }
 
@@ -67,6 +68,7 @@ impl std::fmt::Display for Venue {
         match self {
             Venue::UniswapV3 { fee } => write!(f, "UniV3-{fee}"),
             Venue::PancakeV3 { fee } => write!(f, "Pancake-{fee}"),
+            Venue::CamelotV3 => write!(f, "Camelot-dyn"),
             Venue::SushiV2 => write!(f, "SushiV2"),
         }
     }
@@ -80,6 +82,9 @@ impl std::str::FromStr for Venue {
         if s.eq_ignore_ascii_case("SushiV2") {
             return Ok(Venue::SushiV2);
         }
+        if s.eq_ignore_ascii_case("Camelot-dyn") || s.eq_ignore_ascii_case("CamelotV3") {
+            return Ok(Venue::CamelotV3);
+        }
         if let Some(rest) = s.strip_prefix("UniV3-") {
             let fee = rest.parse::<u32>().context("Invalid UniV3 fee tier")?;
             return Ok(Venue::UniswapV3 { fee });
@@ -88,7 +93,7 @@ impl std::str::FromStr for Venue {
             let fee = rest.parse::<u32>().context("Invalid Pancake fee tier")?;
             return Ok(Venue::PancakeV3 { fee });
         }
-        anyhow::bail!("Unknown venue: '{s}'. Expected UniV3-<fee>, Pancake-<fee>, or SushiV2");
+        anyhow::bail!("Unknown venue: '{s}'. Expected UniV3-<fee>, Pancake-<fee>, Camelot-dyn, or SushiV2");
     }
 }
 
@@ -141,7 +146,7 @@ impl MarketState {
     #[allow(dead_code)]
     pub fn liquidity(&self, venue: Venue) -> u128 {
         match venue {
-            Venue::UniswapV3 { .. } | Venue::PancakeV3 { .. } => self
+            Venue::UniswapV3 { .. } | Venue::PancakeV3 { .. } | Venue::CamelotV3 => self
                 .v3
                 .iter()
                 .find(|(p, _)| p.venue == venue)
@@ -162,6 +167,7 @@ pub struct FirstLeg {
     pub quote_out: u128,
     pub quote_token: Address,
     pub quote_decimals: u8,
+    pub fee_bps: Option<f64>,
 }
 
 /// Full round trip: WETH -> Quote on `venue_a`, then Quote -> WETH on `venue_b`.
@@ -177,6 +183,7 @@ pub struct RoundTrip {
     pub quote_token: Address,
     pub quote_decimals: u8,
     pub weth_back: u128,
+    pub camelot_fee_bps: Option<f64>,
 }
 
 fn default_pair() -> String {
@@ -223,6 +230,9 @@ pub struct OpportunityRecord {
     pub sushi_reserve_weth: String,
     /// SushiSwap USDC reserve at read time (6 dec), logged on every record as a JSON string.
     pub sushi_reserve_usdc: String,
+    /// Dynamic fee used in basis points for Camelot V3 quotes (Camelot rows only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_bps_used: Option<f64>,
 }
 
 // ── Pure math ─────────────────────────────────────────────────────────────────
@@ -331,19 +341,27 @@ pub async fn process_block_batched<P: Provider>(
         batch1.push(crate::pricing::sushi_v2::build_reserves_call()?);
     }
 
-    // Calls for first leg V3 quotes across all markets
+    // Calls for first leg quotes across all markets
     let mut batch1_quote_meta = Vec::new();
     for m in markets {
         for p in &m.pools {
             for &size in &m.config.trade_sizes_weth {
                 let weth_in = weth_to_raw(size);
-                let call = uniswap_v3::build_quote_call(
-                    p.quoter,
-                    p.fee,
-                    weth_addr,
-                    p.quote_token,
-                    U256::from(weth_in),
-                )?;
+                let call = match p.venue {
+                    Venue::CamelotV3 => crate::pricing::camelot_v3::build_quote_call(
+                        p.quoter,
+                        weth_addr,
+                        p.quote_token,
+                        U256::from(weth_in),
+                    )?,
+                    _ => uniswap_v3::build_quote_call(
+                        p.quoter,
+                        p.fee,
+                        weth_addr,
+                        p.quote_token,
+                        U256::from(weth_in),
+                    )?,
+                };
                 batch1.push(call);
                 batch1_quote_meta.push((m.config.clone(), p.clone(), size, weth_in));
             }
@@ -406,10 +424,20 @@ pub async fn process_block_batched<P: Provider>(
     // Unpack first legs
     let mut first = Vec::new();
 
-    // 1. V3 first legs from Batch 1
+    // 1. First legs from Batch 1
     for (i, (m_cfg, p, size, weth_in)) in batch1_quote_meta.into_iter().enumerate() {
         let res_idx = quote_start_idx + i;
-        if let Some((quote_out, gas_est)) = uniswap_v3::decode_quote_result(&res1[res_idx]) {
+        let quote_res = match p.venue {
+            Venue::CamelotV3 => {
+                crate::pricing::camelot_v3::decode_quote_result(&res1[res_idx])
+                    .map(|(out, fee_bps)| (out, 0u64, Some(fee_bps)))
+            }
+            _ => {
+                uniswap_v3::decode_quote_result(&res1[res_idx])
+                    .map(|(out, gas_est)| (out, gas_est, None))
+            }
+        };
+        if let Some((quote_out, gas_est, fee_bps)) = quote_res {
             max_gas_estimate = max_gas_estimate.max(gas_est);
             first.push(FirstLeg {
                 pair: m_cfg.pair,
@@ -419,6 +447,7 @@ pub async fn process_block_batched<P: Provider>(
                 quote_out: quote_out.to::<u128>(),
                 quote_token: m_cfg.quote_token,
                 quote_decimals: m_cfg.quote_decimals,
+                fee_bps,
             });
         }
     }
@@ -438,6 +467,7 @@ pub async fn process_block_batched<P: Provider>(
                         quote_out: usdc_out,
                         quote_token: m_usdc.config.quote_token,
                         quote_decimals: 6,
+                        fee_bps: None,
                     });
                 }
             }
@@ -479,8 +509,21 @@ pub async fn process_block_batched<P: Provider>(
                                     quote_token: leg.quote_token,
                                     quote_decimals: leg.quote_decimals,
                                     weth_back,
+                                    camelot_fee_bps: leg.fee_bps,
                                 });
                             }
+                        }
+                    }
+                    Venue::CamelotV3 => {
+                        if let Some(p) = m.pools.iter().find(|p| p.venue == venue_b) {
+                            let call = crate::pricing::camelot_v3::build_quote_call(
+                                p.quoter,
+                                p.quote_token,
+                                weth_addr,
+                                U256::from(leg.quote_out),
+                            )?;
+                            batch2.push(call);
+                            batch2_meta.push((leg.clone(), venue_b));
                         }
                     }
                     Venue::UniswapV3 { .. } | Venue::PancakeV3 { .. } => {
@@ -513,8 +556,19 @@ pub async fn process_block_batched<P: Provider>(
             multicall::DEFAULT_CHUNK_SIZE,
         ).await?;
         for (res, (leg, venue_b)) in r2.iter().zip(batch2_meta) {
-            if let Some((weth_back, gas_est)) = uniswap_v3::decode_quote_result(res) {
+            let quote_res = match venue_b {
+                Venue::CamelotV3 => {
+                    crate::pricing::camelot_v3::decode_quote_result(res)
+                        .map(|(out, fee_bps)| (out, 0u64, Some(fee_bps)))
+                }
+                _ => {
+                    uniswap_v3::decode_quote_result(res)
+                        .map(|(out, gas_est)| (out, gas_est, None))
+                }
+            };
+            if let Some((weth_back, gas_est, fee_bps)) = quote_res {
                 max_gas_estimate = max_gas_estimate.max(gas_est);
+                let camelot_fee_bps = leg.fee_bps.or(fee_bps);
                 trips.push(RoundTrip {
                     pair: leg.pair,
                     venue_a: leg.venue,
@@ -525,6 +579,7 @@ pub async fn process_block_batched<P: Provider>(
                     quote_token: leg.quote_token,
                     quote_decimals: leg.quote_decimals,
                     weth_back: weth_back.to::<u128>(),
+                    camelot_fee_bps,
                 });
             }
         }
@@ -576,6 +631,20 @@ pub async fn quote_on<P: Provider>(
                 .await?
                 .map(|v| v.to::<u128>()))
         }
+        Venue::CamelotV3 => {
+            let pool = state.v3.iter().find(|(p, _)| p.venue == venue).map(|(p, _)| p);
+            let Some(p) = pool else { return Ok(None); };
+            let res = crate::pricing::camelot_v3::quote(
+                http,
+                p.quoter,
+                state.block,
+                side,
+                U256::from(amount_in),
+                p.quote_token,
+            )
+            .await?;
+            Ok(res.map(|(out, _fee)| out.to::<u128>()))
+        }
     }
 }
 
@@ -614,6 +683,7 @@ pub async fn collect_round_trips<P: Provider>(
                 quote_out: usdc_out,
                 quote_token: usdc_addr,
                 quote_decimals: 6,
+                fee_bps: None,
             }))
         })
         .buffered(MAX_CONCURRENT_RPC)
@@ -644,6 +714,7 @@ pub async fn collect_round_trips<P: Provider>(
                 quote_token: leg.quote_token,
                 quote_decimals: leg.quote_decimals,
                 weth_back,
+                camelot_fee_bps: None,
             }))
         })
         .buffered(MAX_CONCURRENT_RPC)
@@ -692,6 +763,12 @@ pub fn to_records(
             let profit_weth = (t.weth_back as f64 - t.weth_in as f64) / 1e18;
             let est_gross_profit_usd = profit_weth * eth_usd_price;
 
+            let fee_bps_used = if a == Venue::CamelotV3 || b == Venue::CamelotV3 {
+                t.camelot_fee_bps
+            } else {
+                None
+            };
+
             OpportunityRecord {
                 timestamp,
                 logged_at,
@@ -710,6 +787,7 @@ pub fn to_records(
                 pool_liquidity_b: state.pool_liquidity(&t.pair, b).to_string(),
                 sushi_reserve_weth: if t.pair == "WETH/USDC" { sushi_reserve_weth.clone() } else { "0".into() },
                 sushi_reserve_usdc: if t.pair == "WETH/USDC" { sushi_reserve_usdc.clone() } else { "0".into() },
+                fee_bps_used,
             }
         })
         .collect();
@@ -720,6 +798,74 @@ pub fn to_records(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     records
+}
+
+/// One heartbeat record per market per processed block.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+pub struct HeartbeatRecord {
+    pub timestamp: u64,
+    pub block_number: u64,
+    pub pair: String,
+    pub best_spread_bps: f64,
+    pub best_venue_a: String,
+    pub best_venue_b: String,
+    pub best_direction: String,
+    pub best_size_weth: f64,
+}
+
+/// Extract the single best candidate opportunity per market for the heartbeat log.
+/// Assumes `records` are sorted descending by `gross_spread_bps`.
+pub fn extract_heartbeat_records(records: &[OpportunityRecord]) -> Vec<HeartbeatRecord> {
+    let mut heartbeats = Vec::new();
+    let mut seen_pairs = std::collections::HashSet::new();
+
+    for r in records {
+        if seen_pairs.insert(r.pair.clone()) {
+            heartbeats.push(HeartbeatRecord {
+                timestamp: r.timestamp,
+                block_number: r.block_number,
+                pair: r.pair.clone(),
+                best_spread_bps: r.gross_spread_bps,
+                best_venue_a: r.venue_a.clone(),
+                best_venue_b: r.venue_b.clone(),
+                best_direction: r.direction.clone(),
+                best_size_weth: r.size_weth,
+            });
+        }
+    }
+    heartbeats.sort_by(|a, b| a.pair.cmp(&b.pair));
+    heartbeats
+}
+
+/// Append heartbeat records to a JSONL file, flushing immediately every block.
+pub fn append_heartbeat_jsonl(path: &str, heartbeats: &[HeartbeatRecord]) -> Result<()> {
+    use std::io::Write;
+    if heartbeats.is_empty() {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Cannot open heartbeat file: {path}"))?;
+
+    for hb in heartbeats {
+        let line = serde_json::to_string(hb)
+            .context("Failed to serialise heartbeat record")?;
+        writeln!(file, "{line}").with_context(|| format!("Heartbeat write failed: {path}"))?;
+    }
+    file.flush().with_context(|| format!("Heartbeat flush failed: {path}"))?;
+    Ok(())
+}
+
+/// Filter opportunity records according to `LOG_MIN_SPREAD_BPS`.
+/// Always writes positive spreads (gross_spread_bps > 0.0), regardless of threshold.
+pub fn filter_records_by_threshold(records: &[OpportunityRecord], min_spread_bps: f64) -> Vec<OpportunityRecord> {
+    records
+        .iter()
+        .filter(|r| r.gross_spread_bps >= min_spread_bps || r.gross_spread_bps > 0.0)
+        .cloned()
+        .collect()
 }
 
 /// Append a slice of records to a JSONL file (one JSON object per line).
@@ -742,6 +888,7 @@ pub fn append_jsonl(path: &str, records: &[OpportunityRecord]) -> Result<()> {
             .context("Failed to serialise opportunity record")?;
         writeln!(file, "{line}").with_context(|| format!("Write failed: {path}"))?;
     }
+    file.flush().with_context(|| format!("Flush failed: {path}"))?;
     Ok(())
 }
 
@@ -844,6 +991,7 @@ mod tests {
                 quote_token: Address::ZERO,
                 quote_decimals: 6,
                 weth_back: w + w / 1000,
+                camelot_fee_bps: None,
             },
             // V3 -> Sushi : -100 bps
             RoundTrip {
@@ -856,6 +1004,7 @@ mod tests {
                 quote_token: Address::ZERO,
                 quote_decimals: 6,
                 weth_back: w - w / 100,
+                camelot_fee_bps: None,
             },
         ];
         let recs = to_records(1, 2, 3, &state, &trips, 2600.0);
@@ -908,6 +1057,7 @@ mod tests {
             pool_liquidity_b: "2000".into(),
             sushi_reserve_weth: "3000".into(),
             sushi_reserve_usdc: "4000".into(),
+            fee_bps_used: None,
         };
 
         let temp_dir = std::env::temp_dir();
@@ -947,6 +1097,189 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[test]
+    fn test_threshold_filter_positives_always_logged() {
+        let dummy = |spread: f64| OpportunityRecord {
+            timestamp: 1000,
+            logged_at: 1001,
+            block_number: 100,
+            pair: "WETH/USDC".into(),
+            venue_a: "UniV3-500".into(),
+            venue_b: "SushiV2".into(),
+            direction: "a_to_b".into(),
+            size_weth: 0.01,
+            weth_out: "0".into(),
+            usdc_mid: "0".into(),
+            mid_amount: "0".into(),
+            gross_spread_bps: spread,
+            est_gross_profit_usd: 0.0,
+            pool_liquidity_a: "0".into(),
+            pool_liquidity_b: "0".into(),
+            sushi_reserve_weth: "0".into(),
+            sushi_reserve_usdc: "0".into(),
+            fee_bps_used: None,
+        };
+
+        let records = vec![
+            dummy(-5.0),
+            dummy(-2.5),
+            dummy(-2.0),
+            dummy(-1.5),
+            dummy(-0.5),
+            dummy(0.0),
+            dummy(0.5),
+            dummy(2.5),
+        ];
+
+        // Case 1: default threshold -2.0 bps
+        let filtered_default = filter_records_by_threshold(&records, -2.0);
+        let spreads_default: Vec<f64> = filtered_default.iter().map(|r| r.gross_spread_bps).collect();
+        assert_eq!(spreads_default, vec![-2.0, -1.5, -0.5, 0.0, 0.5, 2.5]);
+
+        // Case 2: higher threshold (e.g. +1.0 bps) — positives (> 0.0) MUST always be logged
+        let filtered_high = filter_records_by_threshold(&records, 1.0);
+        let spreads_high: Vec<f64> = filtered_high.iter().map(|r| r.gross_spread_bps).collect();
+        // 0.5 is > 0.0 so logged even though < 1.0; 2.5 is >= 1.0 so logged
+        assert_eq!(spreads_high, vec![0.5, 2.5]);
+
+        // Case 3: threshold 0.0 bps
+        let filtered_zero = filter_records_by_threshold(&records, 0.0);
+        let spreads_zero: Vec<f64> = filtered_zero.iter().map(|r| r.gross_spread_bps).collect();
+        assert_eq!(spreads_zero, vec![0.0, 0.5, 2.5]);
+    }
+
+    #[test]
+    fn test_heartbeat_content() {
+        let dummy = |pair: &str, spread: f64, v_a: &str, v_b: &str, dir: &str, size: f64| OpportunityRecord {
+            timestamp: 1700000000,
+            logged_at: 1700000001,
+            block_number: 500,
+            pair: pair.into(),
+            venue_a: v_a.into(),
+            venue_b: v_b.into(),
+            direction: dir.into(),
+            size_weth: size,
+            weth_out: "0".into(),
+            usdc_mid: "0".into(),
+            mid_amount: "0".into(),
+            gross_spread_bps: spread,
+            est_gross_profit_usd: 0.0,
+            pool_liquidity_a: "0".into(),
+            pool_liquidity_b: "0".into(),
+            sushi_reserve_weth: "0".into(),
+            sushi_reserve_usdc: "0".into(),
+            fee_bps_used: None,
+        };
+
+        // Two markets, multiple records per market sorted descending by spread
+        let records = vec![
+            dummy("WETH/USDC", -1.2, "UniV3-500", "Pancake-100", "a_to_b", 0.05), // best for USDC
+            dummy("WETH/WBTC", -0.8, "UniV3-500", "Pancake-100", "b_to_a", 0.1),  // best for WBTC
+            dummy("WETH/USDC", -5.5, "UniV3-3000", "Pancake-100", "a_to_b", 0.1),
+            dummy("WETH/WBTC", -12.0, "UniV3-500", "UniV3-3000", "a_to_b", 0.5),
+        ];
+
+        let heartbeats = extract_heartbeat_records(&records);
+        assert_eq!(heartbeats.len(), 2, "must extract exactly 1 line per market");
+
+        let usdc_hb = heartbeats.iter().find(|h| h.pair == "WETH/USDC").unwrap();
+        assert_eq!(usdc_hb.block_number, 500);
+        assert_eq!(usdc_hb.timestamp, 1700000000);
+        assert_eq!(usdc_hb.best_spread_bps, -1.2);
+        assert_eq!(usdc_hb.best_venue_a, "UniV3-500");
+        assert_eq!(usdc_hb.best_venue_b, "Pancake-100");
+        assert_eq!(usdc_hb.best_direction, "a_to_b");
+        assert_eq!(usdc_hb.best_size_weth, 0.05);
+
+        let wbtc_hb = heartbeats.iter().find(|h| h.pair == "WETH/WBTC").unwrap();
+        assert_eq!(wbtc_hb.best_spread_bps, -0.8);
+        assert_eq!(wbtc_hb.best_direction, "b_to_a");
+        assert_eq!(wbtc_hb.best_size_weth, 0.1);
+
+        // Test writing and appending heartbeat file
+        let temp_dir = std::env::temp_dir();
+        let hb_file = temp_dir.join(format!(
+            "arb_test_hb_{}.heartbeat.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = hb_file.to_str().unwrap();
+
+        append_heartbeat_jsonl(path_str, &heartbeats).expect("append heartbeat");
+        let content = std::fs::read_to_string(&hb_file).expect("read heartbeat file");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+
+        let parsed: HeartbeatRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.pair, "WETH/USDC");
+
+        let _ = std::fs::remove_file(&hb_file);
+    }
+
+    #[test]
+    fn test_legacy_record_deserialization_without_fee_bps_used() {
+        let legacy_json = r#"{
+            "timestamp": 1700000000,
+            "logged_at": 1700000001,
+            "block_number": 123456,
+            "pair": "WETH/USDC",
+            "venue_a": "UniV3-500",
+            "venue_b": "SushiV2",
+            "direction": "a_to_b",
+            "size_weth": 0.01,
+            "weth_out": "9966649150947404",
+            "gross_spread_bps": -33.5,
+            "pool_liquidity_a": "1000",
+            "pool_liquidity_b": "2000",
+            "sushi_reserve_weth": "3000",
+            "sushi_reserve_usdc": "4000"
+        }"#;
+
+        let rec: OpportunityRecord = serde_json::from_str(legacy_json).expect("deserialize legacy JSON");
+        assert_eq!(rec.block_number, 123456);
+        assert_eq!(rec.venue_a, "UniV3-500");
+        assert_eq!(rec.fee_bps_used, None);
+    }
+
+    #[test]
+    fn test_camelot_record_serialization_and_deserialization() {
+        let rec = OpportunityRecord {
+            timestamp: 1700000000,
+            logged_at: 1700000001,
+            block_number: 123456,
+            pair: "WETH/USDC".into(),
+            venue_a: "UniV3-500".into(),
+            venue_b: "Camelot-dyn".into(),
+            direction: "a_to_b".into(),
+            size_weth: 0.01,
+            weth_out: "10000000000000000".into(),
+            usdc_mid: "2500000000".into(),
+            mid_amount: "2500000000".into(),
+            gross_spread_bps: 0.5,
+            est_gross_profit_usd: 0.01,
+            pool_liquidity_a: "1000".into(),
+            pool_liquidity_b: "0".into(),
+            sushi_reserve_weth: "0".into(),
+            sushi_reserve_usdc: "0".into(),
+            fee_bps_used: Some(1.23),
+        };
+
+        let json = serde_json::to_string(&rec).expect("serialize");
+        assert!(json.contains(r#""fee_bps_used":1.23"#));
+
+        let parsed: OpportunityRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.fee_bps_used, Some(1.23));
+        assert_eq!(parsed.venue_b, "Camelot-dyn");
+    }
+
+    #[test]
+    fn test_venue_camelot_dyn_parsing_and_display() {
+        assert_eq!("Camelot-dyn".parse::<Venue>().unwrap(), Venue::CamelotV3);
+        assert_eq!(Venue::CamelotV3.to_string(), "Camelot-dyn");
     }
 }
 

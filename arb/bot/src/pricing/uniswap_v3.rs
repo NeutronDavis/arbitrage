@@ -232,6 +232,18 @@ pub async fn discover_market_pools<P: Provider>(
                 });
             }
             Venue::SushiV2 => {}
+            Venue::CamelotV3 => {
+                if let Some(cp) = crate::pricing::camelot_v3::discover_camelot_pool(http, pair, quote_token).await? {
+                    pools.push(V3Pool {
+                        pair: pair.to_string(),
+                        venue: Venue::CamelotV3,
+                        fee: 0,
+                        address: cp.address,
+                        quoter: cp.quoter,
+                        quote_token,
+                    });
+                }
+            }
         }
     }
 

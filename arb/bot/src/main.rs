@@ -49,6 +49,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     discover: bool,
 
+    /// Output path for discovered markets file (default: data/markets.json).
+    #[arg(long, default_value = "data/markets.json")]
+    markets_out: String,
+
     /// Minimum WETH balance required for a pool to be kept (default: 10.0 WETH).
     #[arg(long)]
     min_pool_weth: Option<f64>,
@@ -70,6 +74,10 @@ struct Args {
 struct Ctx {
     markets: Vec<MarketSetup>,
     output_file: String,
+    heartbeat_file: String,
+    stats_file: String,
+    log_min_spread_bps: f64,
+    stats: std::sync::Arc<tokio::sync::Mutex<summary::StatsSnapshot>>,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -91,11 +99,11 @@ async fn run() -> Result<()> {
     // If --summarize is requested, run analysis and exit immediately without RPC connection.
     if let Some(path_opt) = args.summarize {
         let path = path_opt.unwrap_or_else(|| "data/opportunities.jsonl".into());
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("Cannot open JSONL file: {path}"))?;
-        let stats = summary::summarize_reader_with_usd_min(std::io::BufReader::new(file), args.usd_min)?;
+        let (stats, hb_summaries) = summary::summarize_from_paths(Path::new(&path), args.usd_min)
+            .with_context(|| format!("Cannot summarise file: {path}"))?;
         println!("File: {path}");
         summary::print_summary(&stats, args.top, args.usd_min);
+        summary::print_market_heartbeat_table(&hb_summaries);
         return Ok(());
     }
 
@@ -103,10 +111,10 @@ async fn run() -> Result<()> {
 
     let http = build_http_provider(&cfg.rpc_http)?;
 
-    // If --discover is requested, run pool discovery and write data/markets.json
+    // If --discover is requested, run pool discovery and write discovered markets file
     if args.discover {
         let min_weth = args.min_pool_weth.unwrap_or(10.0);
-        discover::run_discovery(&http, min_weth, "data/markets.json").await?;
+        discover::run_discovery(&http, min_weth, &args.markets_out).await?;
         return Ok(());
     }
 
@@ -159,10 +167,14 @@ async fn run() -> Result<()> {
         anyhow::bail!("No active pools discovered across any market — check MARKETS/VENUES configuration");
     }
 
-    // Ensure output directory exists.
-    if let Some(parent) = Path::new(&cfg.output_file).parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Cannot create output dir {:?}", parent))?;
+    // Ensure output directories exist.
+    for path in [&cfg.output_file, &cfg.heartbeat_file, &cfg.stats_file] {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Cannot create output dir {:?}", parent))?;
+            }
+        }
     }
 
     let calls = rpc_calls_per_block();
@@ -170,12 +182,23 @@ async fn run() -> Result<()> {
         rpc_calls_per_processed_block = calls,
         log_every_n_blocks = cfg.log_every_n_blocks,
         markets = cfg.markets.len(),
-        "RPC budget (Multicall3 batched)"
+        log_min_spread_bps = cfg.log_min_spread_bps,
+        heartbeat_file = %cfg.heartbeat_file,
+        stats_file = %cfg.stats_file,
+        "RPC budget and logging thresholds (Multicall3 batched)"
     );
+
+    // Load existing stats snapshot on startup if present
+    let initial_stats = summary::StatsSnapshot::load_or_default(&cfg.stats_file);
+    let stats = std::sync::Arc::new(tokio::sync::Mutex::new(initial_stats));
 
     let ctx = Ctx {
         markets: market_setups,
         output_file: cfg.output_file.clone(),
+        heartbeat_file: cfg.heartbeat_file.clone(),
+        stats_file: cfg.stats_file.clone(),
+        log_min_spread_bps: cfg.log_min_spread_bps,
+        stats,
     };
 
     if args.dry_run_once {
@@ -256,6 +279,26 @@ async fn run() -> Result<()> {
         },
     );
 
+    // Periodic 10-minute stats snapshot saver
+    let stats_timer_ctx = std::sync::Arc::clone(&ctx.stats);
+    let stats_timer_file = ctx.stats_file.clone();
+    let stats_timer = async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+        interval.tick().await; // consume initial tick
+        loop {
+            interval.tick().await;
+            let st = stats_timer_ctx.lock().await;
+            if let Err(e) = st.save_atomic(&stats_timer_file) {
+                warn!(error = %e, "Failed to save periodic 10-minute stats snapshot");
+            } else {
+                info!(path = %stats_timer_file, "Saved periodic 10-minute stats snapshot");
+            }
+        }
+    };
+
+    let shutdown_stats = std::sync::Arc::clone(&ctx.stats);
+    let shutdown_stats_file = ctx.stats_file.clone();
+
     tokio::select! {
         res = block_loop => {
             if let Err(e) = res {
@@ -263,8 +306,12 @@ async fn run() -> Result<()> {
                     error = %provider::redact_urls(&format!("{e:#}")),
                     "WebSocket block loop terminated with error"
                 );
+                let st = shutdown_stats.lock().await;
+                let _ = st.save_atomic(&shutdown_stats_file);
                 std::process::exit(1);
             }
+            let st = shutdown_stats.lock().await;
+            let _ = st.save_atomic(&shutdown_stats_file);
             Ok(())
         }
         tripped = watchdog_runner.run() => {
@@ -274,7 +321,22 @@ async fn run() -> Result<()> {
                 "Watchdog tripped: no sampled block processed for {} seconds; exiting with non-zero code",
                 cfg.watchdog_secs
             );
+            let st = shutdown_stats.lock().await;
+            let _ = st.save_atomic(&shutdown_stats_file);
             std::process::exit(1);
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C shutdown signal; saving stats snapshot atomically...");
+            let st = shutdown_stats.lock().await;
+            if let Err(e) = st.save_atomic(&shutdown_stats_file) {
+                error!(error = %e, "Failed to save stats snapshot on shutdown");
+            } else {
+                info!(path = %shutdown_stats_file, "Clean shutdown: stats snapshot saved successfully");
+            }
+            std::process::exit(0);
+        }
+        _ = stats_timer => {
+            Ok(())
         }
     }
 }
@@ -312,6 +374,32 @@ async fn process_block(
         batched.eth_usd_price,
     );
 
+    // 1. Extract and write heartbeat records (one line per market per block, flushed immediately)
+    let heartbeats = strategy::extract_heartbeat_records(&records);
+    strategy::append_heartbeat_jsonl(&ctx.heartbeat_file, &heartbeats)?;
+
+    // 2. Accumulate all evaluated records into stats snapshot
+    {
+        let mut st = ctx.stats.lock().await;
+        for r in &records {
+            st.record_sample(
+                &r.pair,
+                &r.venue_a,
+                &r.venue_b,
+                &r.direction,
+                r.size_weth,
+                r.gross_spread_bps,
+            );
+        }
+        if !std::path::Path::new(&ctx.stats_file).exists() {
+            let _ = st.save_atomic(&ctx.stats_file);
+        }
+    }
+
+    // 3. Filter records according to LOG_MIN_SPREAD_BPS (positives always written)
+    let filtered_records = strategy::filter_records_by_threshold(&records, ctx.log_min_spread_bps);
+    strategy::append_jsonl(&ctx.output_file, &filtered_records)?;
+
     let rpc_calls = batched.total_rpc_calls;
 
     info!(
@@ -325,15 +413,24 @@ async fn process_block(
         batch2_payload = batched.batch2_payload_bytes,
         max_gas_estimate = batched.max_gas_estimate,
         eth_usd_price = batched.eth_usd_price,
-        records = records.len(),
+        evaluated = records.len(),
+        logged = filtered_records.len(),
+        heartbeats = heartbeats.len(),
         best_bps = records.first().map(|r| r.gross_spread_bps).unwrap_or(f64::NAN),
         elapsed_ms = t0.elapsed().as_millis(),
         "Block processed"
     );
 
-    strategy::append_jsonl(&ctx.output_file, &records)?;
-
     if dry_run {
+        {
+            let st = ctx.stats.lock().await;
+            if let Err(e) = st.save_atomic(&ctx.stats_file) {
+                warn!(error = %e, "Failed to save stats snapshot in dry run");
+            } else {
+                info!(path = %ctx.stats_file, "Saved stats snapshot in dry run");
+            }
+        }
+
         print_market_snapshot(&ctx.markets, &batched.state, &batched.first);
         print_spreads_per_market(&records);
 
@@ -362,9 +459,12 @@ async fn process_block(
             batched.eth_usd_price
         );
         println!(
-            "\nWrote {} records to {} ({} ms)\n",
+            "\nWrote {} filtered records (evaluated {}) to {}, and {} heartbeats to {} ({} ms)\n",
+            filtered_records.len(),
             records.len(),
             ctx.output_file,
+            heartbeats.len(),
+            ctx.heartbeat_file,
             t0.elapsed().as_millis()
         );
     }
@@ -387,18 +487,28 @@ fn print_market_snapshot(
     for m in markets {
         println!("\n── Market: {} (Quote Decimals: {}) ──", m.config.pair, m.config.quote_decimals);
         println!(
-            "{:<12} {:>8} {:>18} {:>24}",
-            "Venue", "Size(W)", format!("{}/WETH", m.config.symbol), "Depth (V3 L units)"
+            "{:<12} {:>8} {:>18} {:>12} {:>24}",
+            "Venue", "Size(W)", format!("{}/WETH", m.config.symbol), "Fee(bps)", "Depth (V3 L units)"
         );
-        println!("{:-<66}", "");
+        println!("{:-<78}", "");
         let market_first: Vec<&FirstLeg> = first.iter().filter(|l| l.pair == m.config.pair).collect();
         for leg in &market_first {
             let rate = implied_quote_per_weth(leg.weth_in, leg.quote_out, leg.quote_decimals);
+            let fee_str = if let Some(f) = leg.fee_bps {
+                format!("{:.2} (dyn)", f)
+            } else {
+                match leg.venue {
+                    Venue::UniswapV3 { fee } | Venue::PancakeV3 { fee } => format!("{:.2}", fee as f64 / 100.0),
+                    Venue::SushiV2 => "30.00".to_string(),
+                    Venue::CamelotV3 => "-".to_string(),
+                }
+            };
             println!(
-                "{:<12} {:>8.3} {:>18.4} {:>24}",
+                "{:<12} {:>8.3} {:>18.4} {:>12} {:>24}",
                 leg.venue.to_string(),
                 leg.size_weth,
                 rate,
+                fee_str,
                 state.pool_liquidity(&leg.pair, leg.venue)
             );
         }
@@ -440,10 +550,10 @@ fn print_spreads_per_market(records: &[OpportunityRecord]) {
     for pair in pairs {
         println!("\n── Market: {} ──", pair);
         println!(
-            "{:<12} {:<12} {:<8} {:>8} {:>14} {:>12} {:>14}",
-            "Venue A", "Venue B", "Dir", "Size(W)", "Spread(bps)", "Est USD", "Result"
+            "{:<12} {:<12} {:<8} {:>8} {:>14} {:>12} {:>12} {:>14}",
+            "Venue A", "Venue B", "Dir", "Size(W)", "Spread(bps)", "Est USD", "DynFee(bps)", "Result"
         );
-        println!("{:-<84}", "");
+        println!("{:-<96}", "");
         let market_recs: Vec<&OpportunityRecord> = records.iter().filter(|r| r.pair == pair).collect();
         for r in market_recs {
             let verdict = if r.gross_spread_bps >= 0.0 {
@@ -451,9 +561,10 @@ fn print_spreads_per_market(records: &[OpportunityRecord]) {
             } else {
                 "NET LOSS"
             };
+            let dyn_fee_str = r.fee_bps_used.map(|f| format!("{:.2}", f)).unwrap_or_else(|| "-".into());
             println!(
-                "{:<12} {:<12} {:<8} {:>8.3} {:>14.2} {:>12.2} {:>14}",
-                r.venue_a, r.venue_b, r.direction, r.size_weth, r.gross_spread_bps, r.est_gross_profit_usd, verdict
+                "{:<12} {:<12} {:<8} {:>8.3} {:>14.2} {:>12.2} {:>12} {:>14}",
+                r.venue_a, r.venue_b, r.direction, r.size_weth, r.gross_spread_bps, r.est_gross_profit_usd, dyn_fee_str, verdict
             );
         }
     }

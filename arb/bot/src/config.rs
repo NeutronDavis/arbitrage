@@ -53,6 +53,13 @@ pub struct Config {
     pub markets: Vec<MarketConfig>,
     /// Path for the JSONL opportunity log file.
     pub output_file: String,
+    /// Threshold logging in basis points. Full row written to output_file only when
+    /// gross_spread_bps >= log_min_spread_bps (positives always written). Default is -2.0.
+    pub log_min_spread_bps: f64,
+    /// Path for the heartbeat JSONL file. Default: output_file + ".heartbeat.jsonl".
+    pub heartbeat_file: String,
+    /// Path for the stats snapshot JSON file. Default: output_file + ".stats.json".
+    pub stats_file: String,
     /// Watchdog timeout in seconds. If no sampled block is processed for this long,
     /// the bot logs an ERROR and exits with a non-zero code. Default is 90 seconds.
     pub watchdog_secs: u64,
@@ -68,6 +75,9 @@ impl std::fmt::Debug for Config {
             .field("log_every_n_blocks", &self.log_every_n_blocks)
             .field("markets", &self.markets)
             .field("output_file", &self.output_file)
+            .field("log_min_spread_bps", &self.log_min_spread_bps)
+            .field("heartbeat_file", &self.heartbeat_file)
+            .field("stats_file", &self.stats_file)
             .field("watchdog_secs", &self.watchdog_secs)
             .finish()
     }
@@ -181,6 +191,25 @@ impl Config {
         let output_file = std::env::var("OUTPUT_FILE")
             .unwrap_or_else(|_| "data/opportunities.jsonl".into());
 
+        let log_min_spread_bps: f64 = std::env::var("LOG_MIN_SPREAD_BPS")
+            .unwrap_or_else(|_| "-2.0".into())
+            .trim()
+            .parse()
+            .context("LOG_MIN_SPREAD_BPS must be a valid float")?;
+
+        if log_min_spread_bps > -1.0 {
+            tracing::warn!(
+                log_min_spread_bps,
+                "LOG_MIN_SPREAD_BPS is above -1.0 bps; persistence runs view requires records at or below -1.0 bps"
+            );
+        }
+
+        let heartbeat_file = std::env::var("HEARTBEAT_FILE")
+            .unwrap_or_else(|_| format!("{}.heartbeat.jsonl", output_file));
+
+        let stats_file = std::env::var("STATS_FILE")
+            .unwrap_or_else(|_| format!("{}.stats.json", output_file));
+
         let watchdog_secs: u64 = std::env::var("WATCHDOG_SECS")
             .unwrap_or_else(|_| "90".into())
             .trim()
@@ -199,6 +228,9 @@ impl Config {
             log_every_n_blocks,
             markets,
             output_file,
+            log_min_spread_bps,
+            heartbeat_file,
+            stats_file,
             watchdog_secs,
         })
     }

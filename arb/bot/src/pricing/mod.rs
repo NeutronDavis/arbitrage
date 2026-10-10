@@ -2,6 +2,7 @@
 //!
 //! Decimals: WETH = 18, USDC = 6 (Arbitrum native USDC).
 
+pub mod camelot_v3;
 pub mod sushi_v2;
 pub mod uniswap_v3;
 

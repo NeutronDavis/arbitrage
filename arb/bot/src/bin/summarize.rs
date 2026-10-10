@@ -9,8 +9,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -37,15 +35,12 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let file = File::open(&args.file)
-        .with_context(|| format!("Cannot open file: {}", args.file.display()))?;
-    let reader = BufReader::new(file);
-
-    let stats = arb_bot::summary::summarize_reader_with_usd_min(reader, args.usd_min)
+    let (stats, hb_summaries) = arb_bot::summary::summarize_from_paths(&args.file, args.usd_min)
         .with_context(|| format!("Failed to summarise {}", args.file.display()))?;
 
     println!("File: {}", args.file.display());
     arb_bot::summary::print_summary(&stats, args.top, args.usd_min);
+    arb_bot::summary::print_market_heartbeat_table(&hb_summaries);
 
     Ok(())
 }

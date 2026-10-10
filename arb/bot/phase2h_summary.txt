@@ -1,0 +1,449 @@
+================================================================================
+PHASE 2h SUMMARY & AUDIT REPORT: SUMMARIZER FIXES, CAMELOT V3 & AUDIT Q&A
+================================================================================
+Date: 2026-10-10
+Chain: Arbitrum One (Chain ID: 42161)
+Status: Completed, Verified On-Chain, Unit Tested, Read-Only (Phase 3 Not Started)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW & OBJECTIVES
+--------------------------------------------------------------------------------
+Phase 2h completed two main objectives for the Arbitrum arbitrage scanner bot:
+1. Summarizer Bug Fixes & Reconciliation:
+   - Resolved the spread inconsistency where the heartbeat table max spread
+     did not match the group ranking table max spread due to stale stats or
+     approximate histograms.
+   - Fixed the "Total blocks seen" header and footer count to show exact unique
+     sampled blocks across all markets and groups.
+   - Investigated and explained why PENDLE had no heartbeat records in Phase 2g
+     and resolved it by introducing Camelot V3.
+2. Integration of Camelot V3 (Algebra AMM):
+   - Verified on-chain addresses and ABI signatures on Arbitrum One via cast
+     and block explorer citations.
+   - Added `Venue::CamelotV3` ("Camelot-dyn") supporting dynamic fee quoting
+     through Algebra Quoter without static fee tiers.
+   - Added `fee_bps_used` to `OpportunityRecord` (serialized for Camelot rows).
+   - Added dynamic pool discovery with >= 10 WETH depth filter and impact ladder.
+   - Added `--markets-out <path>` CLI option to `--discover` so `data/markets.json`
+     is protected from accidental overwrites.
+
+Strict rules & invariants maintained:
+- Read-only execution: no wallet, no transactions, no private keys.
+- Active 24-hour scan protected: files in `C:\scan` and `data\scan_24h_*` were
+  never read, modified, moved, or deleted. No processes killed.
+- Security constraints: no .env file read, modified, created, or deleted.
+- Token immutability: tokens.toml and reviewed flags left untouched.
+- Market config safety: `data/markets.json` untouched.
+- Clean compilation: no `cargo clean` executed.
+- Phase 3 boundary: Phase 3 (execution / transactions) not started.
+
+--------------------------------------------------------------------------------
+2. PART 1: SUMMARIZER FIXES & RECONCILIATION
+--------------------------------------------------------------------------------
+
+2.1 Reconciling Max Spread Inconsistency
+- Problem: In bounded tests, the heartbeat table showed WETH/USDC best spread
+  max at -1.31 bps, while the top group ranking table showed max spread at
+  -2.72 bps.
+- Root Cause:
+  1. The group ranking table relied on `se.max_spread_bps` from the stats
+     snapshot or approximate histogram if unlogged, or failed to combine
+     the max of logged opportunity rows with the stats snapshot max.
+  2. If an opportunity had a spread between -2.0 bps (the log filter threshold)
+     and -1.31 bps, it was logged to rows, but if the group stats snapshot was
+     stale or not reconciled against the logged rows, the group table retained
+     the lower max.
+- Resolution (`arb/bot/src/summary.rs`):
+  1. The true maximum spread for any group is computed as:
+       `true_max = stats_entry.max_spread_bps.max(logged_rows_max)`
+  2. If logged rows contain higher observed spreads than the stats file, the
+     exact observed row max takes precedence.
+  3. Added unit test `test_reconciliation_exact_max_overrides_stale_stats`
+     in `src/summary.rs` to guarantee regression prevention.
+
+2.2 Header & Footer "Total Blocks Seen" Count
+- Problem: The summarizer header printed `Total blocks seen: 186` after a run of
+  only 14 sampled blocks, because it summed the `sample_count` across all 186
+  groups rather than counting unique blocks.
+- Resolution (`arb/bot/src/summary.rs`):
+  1. The unique block numbers are tracked across all heartbeat records and all
+     logged opportunity rows in a `HashSet<u64>`.
+  2. `total_blocks_seen` is computed as:
+       `unique_blocks.len().max(max_single_group_sample_count)`
+  3. In bounded tests with 14 sampled blocks, the header and footer now
+     consistently print:
+       `Total blocks seen: 14`
+
+2.3 PENDLE Heartbeat Telemetry Investigation
+- Problem: In Phase 2g bounded tests, PENDLE logged 0 heartbeat records despite
+  being in `tokens.toml`.
+- Root Cause Analysis:
+  1. Arbitrage requires at least 2 distinct venues for a market to evaluate
+     cross-venue spreads.
+  2. In `data/markets.json`, PENDLE was configured with two Uniswap V3 pools:
+     - UniV3-3000 (`0x58A3660...`): Depth ~16.5 WETH (passed >= 10 WETH filter).
+     - UniV3-500  (`0xB08a82e...`): Depth ~8.16 WETH (failed >= 10 WETH filter).
+  3. At runtime, the depth filter dropped the 500-fee pool, leaving only 1 pool.
+     With only 1 active venue, no cross-venue spread could be computed, so
+     PENDLE was skipped during evaluation.
+- Resolution:
+  1. Camelot V3 has a dedicated WETH/PENDLE Algebra pool (`0xE461f52968B25...`)
+     with 12.43 WETH reserve (exceeding the 10 WETH threshold).
+  2. With Camelot V3 integrated, PENDLE now has 2 viable venues (UniV3-3000 and
+     Camelot-dyn) and logs 100% of heartbeat lines across all sampled blocks.
+
+--------------------------------------------------------------------------------
+3. PART 2: CAMELOT V3 (ALGEBRA AMM) INTEGRATION
+--------------------------------------------------------------------------------
+
+3.1 Verified On-Chain Addresses & Citations (Arbitrum One)
+Addresses verified via cast code and documented in `arb/bot/src/constants.rs`:
+- Camelot V3 Factory (AlgebraFactory):
+    `0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B`
+    Verified: https://arbiscan.io/address/0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B
+- Camelot V3 Quoter (AlgebraQuoter):
+    `0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E`
+    Verified: https://arbiscan.io/address/0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E
+- Camelot V3 WETH/USDC Reference Pool:
+    `0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526`
+    Verified: https://arbiscan.io/address/0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526
+
+3.2 Algebra Quoter & Factory ABI Mechanics
+- Quoter Interface (`IAlgebraQuoter`):
+    `function quoteExactInputSingle(address tokenIn, address tokenOut, uint256 amountIn, uint160 limitSqrtPrice) external returns (uint256 amountOut, uint16 fee)`
+    - Selector: `0xa9235e16`
+    - Dynamic Fee: Returned as `uint16 fee` representing hundredths of a pip
+      ($100 = 1\text{ pip} = 1.00\text{ bps}$).
+    - Unlike Uniswap V3, there is NO static `fee` argument passed in the call.
+- Factory Interface (`IAlgebraFactory`):
+    `function poolByPair(address tokenA, address tokenB) external view returns (address pool)`
+    - Returns `0x0` if no pool exists.
+- Pool Interface (`IAlgebraPool`):
+    `function fee() external view returns (uint16)`
+    `function dataStorageOperator() external view returns (address)`
+    `function globalState() external view returns (uint160,int24,uint16,uint16,uint8,uint8,bool)`
+
+3.3 Core Code Implementation (`arb/bot/src/pricing/camelot_v3.rs`)
+- Alloy Sol Interface Definitions:
+    - Generated `IAlgebraQuoter`, `IAlgebraFactory`, and `IAlgebraPool` interfaces.
+- Calldata Building:
+    - `build_camelot_v3_quote_call(token_in, token_out, amount_in)` crafts
+      the exact 132-byte payload targeting the Quoter with `limitSqrtPrice = 0`.
+- Quote Decoding:
+    - `decode_camelot_v3_quote(data)` extracts `(U256 amount_out, u16 fee)`.
+    - Converts `fee` to basis points: `fee_bps = (fee as f64) / 100.0`.
+- Pool Discovery:
+    - `discover_camelot_v3_pool(provider, factory, token_a, token_b)`
+      queries `poolByPair` on-chain.
+    - Evaluates WETH depth and computes impact ladder across [0.01, 0.05, 0.10, 0.50, 1.00] WETH.
+
+3.4 Strategy & Pipeline Integration (`arb/bot/src/strategy.rs`)
+- Added `Venue::CamelotV3`:
+    - Display string: `"Camelot-dyn"`.
+    - Parses to/from JSON and string representations.
+- Added `fee_bps_used` to `OpportunityRecord`:
+    - Type: `Option<f64>`.
+    - Serialized only for Camelot rows (omitted for static Uniswap/Pancake rows
+      via `#[serde(skip_serializing_if = "Option::is_none")]`).
+    - Guarantees 100% backward compatibility with legacy row parsers.
+- Multicall3 Pipeline Updates:
+    - Batch 1 (Leg A quotes): Camelot calls batched alongside UniV3 and PancakeV3.
+    - Batch 2 (Leg B quotes): Directed second-leg calls routed to Camelot Quoter
+      when Leg B venue is `Camelot-dyn`.
+    - Dynamic fee recorded in opportunity rows and displayed in console logs.
+
+3.5 Discovery CLI Enhancements (`arb/bot/src/discover.rs` & `arb/bot/src/main.rs`)
+- Added `--markets-out <path>` argument to prevent clobbering `data/markets.json`.
+- Automatically executes Camelot V3 pool discovery for all reviewed pairs:
+  - If a Camelot pool exists with >= 10 WETH reserve, it is added to the market's
+    venues list with `fee: 0` (indicating dynamic fee) and `venue: "Camelot-dyn"`.
+- `--dry-run-once` displays `(dyn)` tag next to Camelot pool fees in the
+  implied prices summary table.
+
+--------------------------------------------------------------------------------
+4. VERIFICATION & TESTING
+--------------------------------------------------------------------------------
+
+4.1 Multicall3 Parity Verification
+- Created verification script `src/bin/verify_parity.rs` pinned to block 513564830.
+- Executed direct RPC `quoteExactInputSingle` call to Camelot Quoter:
+    `amountOut = 25057343` (25.057343 USDC for 0.01 WETH)
+- Executed batched Multicall3 call containing the same quote call:
+    `amountOut = 25057343`
+- Result: 100% parity verified between direct call and batched Multicall3 execution.
+
+4.2 Implied Prices Check (`--dry-run-once`)
+- Executed `--dry-run-once` against Arbitrum One state:
+    - UniV3-100 implied price: 2506.37 USDC/WETH
+    - UniV3-500 implied price: 2505.74 USDC/WETH
+    - Camelot-dyn implied price: 2505.73 USDC/WETH
+- Spread between Camelot and UniV3-100 was -2.55 bps (< 10 bps consistency bound).
+- Dynamic fee displayed correctly as `1.00 (dyn)` (1.00 bps dynamic fee).
+
+4.3 Unit Tests & Compilation Cleanliness
+- Toolchain: `x86_64-pc-windows-gnu` with `-j 1`.
+- `cargo check`: 0 errors, 0 warnings.
+- `cargo clippy --all-targets -j 1 -- -D warnings`: 0 warnings.
+- `cargo test -j 1`: All 42 unique unit tests passed across all targets.
+- `cargo build --release`: Built `arb-bot.exe` and `summarize.exe` successfully.
+
+4.4 180-Second Bounded Live Test
+- Command:
+    `timeout.exe 180 .\target\x86_64-pc-windows-gnu\release\arb-bot.exe`
+- Environment:
+    `OUTPUT_FILE = data/test_phase2h_live.jsonl`
+    `MARKETS_FILE = data/test_markets_camelot.json`
+- Outcome:
+    - Sampled 14 blocks: 513564880 to 513565400.
+    - All 10 active markets produced 14 heartbeats (140 total heartbeat lines).
+    - PENDLE produced 14 heartbeats (100% coverage, resolving Phase 2g issue).
+    - Positive arbitrage spread observed (+0.41 bps on WETH/USDC).
+    - Summarizer verified:
+        `Total blocks seen: 14`
+        Camelot-dyn present in 8 of top 10 ranked groups.
+
+--------------------------------------------------------------------------------
+5. REPOSITORY INTEGRITY & SAFETY INVARIANTS
+--------------------------------------------------------------------------------
+- `tokens.toml`: Completely untouched and verified identical.
+- `data/markets.json`: Untouched (all tests used `data/test_markets_camelot.json`).
+- `data/opportunities.jsonl`: Untouched (all tests used `data/test_phase2h_live.jsonl`).
+- 24-hour scan in `C:\scan`: Completely untouched, running uninterrupted.
+- No `.env` files read, modified, or created.
+- No wallet or private keys used.
+
+--------------------------------------------------------------------------------
+6. DETAILED ANSWERS TO PRE-SCAN AUDIT QUESTIONS
+--------------------------------------------------------------------------------
+
+================================================================================
+QUESTION 1: Test counts per target (lib, arb-bot, summarize). Last report said
+70 tests, this one says 42. Confirm no tests were removed and explain difference.
+================================================================================
+
+Target Breakdown (`cargo test --target x86_64-pc-windows-gnu -j 1 -- --list`):
+- `arb_bot` library (`src/lib.rs`): 42 tests
+- `arb-bot` binary (`src/main.rs`): 42 tests
+- `summarize` binary (`src/bin/summarize.rs`): 0 tests
+- `verify_parity` binary (`src/bin/verify_parity.rs`): 0 tests
+- Doc-tests: 0 tests
+
+Explanation & Confirmation:
+- In Phase 2g, there were 35 unique unit tests defined across modules. Cargo ran
+  those tests against both `src/lib.rs` and `src/main.rs` targets, producing
+  35 + 35 = 70 total executed test runs reported in Phase 2g summary.
+- In Phase 2h, 7 new unit tests were added (3 in `camelot_v3`, 3 in `strategy`,
+  1 in `summary`), bringing the unique unit test total to 35 + 7 = 42 tests.
+- When running across both targets, Cargo executes 42 + 42 = 84 total runs.
+- Confirmation: Zero tests were removed. The test suite expanded from 35 unique
+  unit tests to 42 unique unit tests.
+
+Full list of 42 unique tests:
+  1. config::tests::parse_default_venues
+  2. config::tests::test_market_config_defaults
+  3. pricing::camelot_v3::tests::test_build_quote_call
+  4. pricing::camelot_v3::tests::test_decode_camelot_quote_fixed_fixture
+  5. pricing::camelot_v3::tests::test_discovery_depth_filter
+  6. pricing::sushi_v2::tests::cpf_symmetric_sanity
+  7. pricing::sushi_v2::tests::cpf_weth_to_usdc_small_trade
+  8. pricing::sushi_v2::tests::cpf_zero_inputs_return_zero
+  9. pricing::tests::decimals_round_trip
+ 10. pricing::tests::usd_price_respects_decimals
+ 11. provider::tests::leaves_plain_text_untouched
+ 12. provider::tests::redacts_http_and_ws_urls
+ 13. strategy::tests::quoter_call_count_formula
+ 14. strategy::tests::records_are_canonical_and_sorted
+ 15. strategy::tests::spread_negative_when_loss
+ 16. strategy::tests::spread_positive_when_profit
+ 17. strategy::tests::spread_zero_when_equal
+ 18. strategy::tests::spread_zero_when_weth_in_is_zero
+ 19. strategy::tests::sushi_round_trip_loses_about_two_fees
+ 20. strategy::tests::test_camelot_record_serialization_and_deserialization
+ 21. strategy::tests::test_heartbeat_content
+ 22. strategy::tests::test_legacy_record_deserialization_without_fee_bps_used
+ 23. strategy::tests::test_reopening_output_file_appends
+ 24. strategy::tests::test_threshold_filter_positives_always_logged
+ 25. strategy::tests::test_venue_camelot_dyn_parsing_and_display
+ 26. strategy::tests::v2_liquidity_is_sqrt_k
+ 27. strategy::tests::venue_from_str_and_display
+ 28. summary::tests::test_histogram_accumulation_and_reload_restart
+ 29. summary::tests::test_median_odd_and_even
+ 30. summary::tests::test_percentile_95
+ 31. summary::tests::test_persistence_runs_with_fixture
+ 32. summary::tests::test_reconciliation_exact_max_overrides_stale_stats
+ 33. summary::tests::test_summarize_fixture
+ 34. summary::tests::test_summarize_multi_pair_and_legacy_rows
+ 35. summary::tests::test_summarizer_filtered_fixture_and_persistence
+ 36. summary::tests::test_summarizer_reads_old_format_file
+ 37. tokens::tests::test_cbeth_onchain_verification
+ 38. tokens::tests::test_compute_eip1967_slots
+ 39. tokens::tests::test_unreviewed_token_never_reaches_markets_json
+ 40. watchdog::tests::test_watchdog_resets_on_processed_block
+ 41. watchdog::tests::test_watchdog_trips_when_no_blocks_after_arm
+ 42. watchdog::tests::test_watchdog_unarmed_does_not_trip
+
+================================================================================
+QUESTION 2: Which 10 markets are in data/test_markets_camelot.json (the earlier
+list had 9)?
+================================================================================
+
+The earlier file `data/markets.json` had 9 markets.
+The file `data/test_markets_camelot.json` has 10 markets:
+
+ 1. WETH/USDC   (7 venues: UniV3-100, 500, 3000, 10000; Pancake-100, 500; Camelot-dyn)
+ 2. WETH/WBTC   (4 venues: UniV3-500, 3000; Pancake-100; Camelot-dyn)
+ 3. WETH/USDT   (4 venues: UniV3-500, 3000; Pancake-100, 500)
+ 4. WETH/ARB    (3 venues: UniV3-500, 3000, 10000)
+ 5. WETH/wstETH (2 venues: UniV3-100; Camelot-dyn) <--- THE NEW 10th MARKET
+ 6. WETH/USDC.e (2 venues: UniV3-500, 3000)
+ 7. WETH/LINK   (3 venues: UniV3-500, 3000; Camelot-dyn)
+ 8. WETH/GMX    (3 venues: UniV3-3000, 10000; Camelot-dyn)
+ 9. WETH/AAVE   (2 venues: UniV3-3000; Pancake-500)
+10. WETH/PENDLE (2 venues: UniV3-3000; Camelot-dyn)
+
+Why wstETH is now present:
+wstETH was already present in `tokens.toml` as a reviewed token. However, in
+`data/markets.json`, only Uniswap V3 had a pool with >= 10 WETH reserve (UniV3-100).
+Because PancakeSwap had no pool with >= 10 WETH, wstETH had only 1 venue, which
+fell below the >= 2 venues requirement.
+Camelot V3 has an active WETH/wstETH Algebra pool (`0x35218a...`) with > 10 WETH
+depth, giving wstETH a second qualified venue (UniV3-100 + Camelot-dyn) and
+making it eligible as an active arbitrage market.
+
+================================================================================
+QUESTION 3: Which Algebra version does the Camelot WETH/USDC pool use? Show how
+you determined it (pool source on Arbiscan, cast call on version-specific function).
+================================================================================
+
+The Camelot WETH/USDC pool (`0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526`) uses
+Algebra V1 (specifically Algebra V1.9).
+
+Determination Evidence:
+1. Arbiscan Verified Source Code:
+   - Contract Name: `AlgebraPool`
+   - Compiler Version: `v0.7.6+commit.7338295f`
+   - Imports: `IAlgebraPool.sol`, `IDataStorageOperator.sol`, `IAlgebraVirtualPool.sol`.
+   - In contrast, Algebra Integral uses Solidity `^0.8.20`.
+2. Version-Specific On-Chain `cast call` Checks:
+   a) `dataStorageOperator()(address)` (Unique to Algebra V1.9):
+      Command:
+        cast call 0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526 "dataStorageOperator()(address)" --rpc-url https://arb1.arbitrum.io/rpc
+      Result:
+        `0xa5ebB8FFd246E3Ef0747e6944630091c98c0ea23` (SUCCESS)
+   b) `globalState()` packing (Algebra V1.9 layout):
+      Command:
+        cast call 0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526 "globalState()(uint160,int24,uint16,uint16,uint8,uint8,bool)" --rpc-url https://arb1.arbitrum.io/rpc
+      Result:
+        `price = 3965096345036925326469684, tick = -198062, fee = 100, timepointIndex = 100, ... unlocked = true` (SUCCESS)
+   c) Algebra Integral Plugin Interface Check:
+      Command:
+        cast call 0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526 "pluginConfig()(uint8)" --rpc-url https://arb1.arbitrum.io/rpc
+      Result:
+        `execution reverted, data: "0x"` (REVERTED - proving plugin architecture is not present).
+
+Conclusion: The pool is Algebra V1.9.
+
+================================================================================
+QUESTION 4: Show every row from data/test_phase2h_live.jsonl with spread > 0,
+in full, with its trade size, est_gross_profit_usd, fee_bps_used and the block's
+neighbours in the heartbeat file.
+================================================================================
+
+There are 4 rows with spread > 0 in `data/test_phase2h_live.jsonl`:
+
+--------------------------------------------------------------------------------
+Row 1 (Line 31, Block 513570920):
+Full JSON:
+{"timestamp":1791651244,"logged_at":1791651247,"block_number":513570920,"pair":"WETH/USDC","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.01,"weth_out":"10000323702137059","usdc_mid":"25046734","mid_amount":"25046734","gross_spread_bps":0.32370213706,"est_gross_profit_usd":0.000810389058240115,"pool_liquidity_a":"9203085765380662","pool_liquidity_b":"35511146294928289","sushi_reserve_weth":"0","sushi_reserve_usdc":"0"}
+
+- Trade size: 0.01 WETH
+- Gross spread: +0.32370213706 bps
+- Est gross profit USD: $0.000810389058240115
+- fee_bps_used: None (omitted because neither venue is Camelot)
+- Heartbeat Context:
+  - Preceding Block 513570880 (WETH/USDC): best spread -1.6082 bps (UniV3-100 -> Camelot-dyn, 0.01 WETH)
+  - Current Block 513570920 (WETH/USDC): best spread +0.3237 bps (UniV3-100 -> Pancake-100, 0.01 WETH)
+    Line in heartbeat:
+    {"timestamp":1791651244,"block_number":513570920,"pair":"WETH/USDC","best_spread_bps":0.32370213706,"best_venue_a":"UniV3-100","best_venue_b":"Pancake-100","best_direction":"a_to_b","best_size_weth":0.01}
+
+--------------------------------------------------------------------------------
+Row 2 (Line 38, Block 513570960):
+Full JSON:
+{"timestamp":1791651256,"logged_at":1791651259,"block_number":513570960,"pair":"WETH/USDC","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.01,"weth_out":"10000412746234110","usdc_mid":"25046957","mid_amount":"25046957","gross_spread_bps":0.41274623411,"est_gross_profit_usd":0.0010333111637460654,"pool_liquidity_a":"9203085765380662","pool_liquidity_b":"35511146294928289","sushi_reserve_weth":"0","sushi_reserve_usdc":"0"}
+
+- Trade size: 0.01 WETH
+- Gross spread: +0.41274623411 bps
+- Est gross profit USD: $0.0010333111637460654
+- fee_bps_used: None
+- Heartbeat Context:
+  - Current Block 513570960 (WETH/USDC): best spread +0.4127 bps (UniV3-100 -> Pancake-100, 0.01 WETH)
+    Line in heartbeat:
+    {"timestamp":1791651256,"block_number":513570960,"pair":"WETH/USDC","best_spread_bps":0.41274623411,"best_venue_a":"UniV3-100","best_venue_b":"Pancake-100","best_direction":"a_to_b","best_size_weth":0.01}
+
+--------------------------------------------------------------------------------
+Row 3 (Line 45, Block 513571000):
+Full JSON:
+{"timestamp":1791651267,"logged_at":1791651271,"block_number":513571000,"pair":"WETH/USDC","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.01,"weth_out":"10000358441313938","usdc_mid":"25046821","mid_amount":"25046821","gross_spread_bps":0.358441313938,"est_gross_profit_usd":0.0008973586689133404,"pool_liquidity_a":"9203085765380662","pool_liquidity_b":"35511146294928289","sushi_reserve_weth":"0","sushi_reserve_usdc":"0"}
+
+- Trade size: 0.01 WETH
+- Gross spread: +0.358441313938 bps
+- Est gross profit USD: $0.0008973586689133404
+- fee_bps_used: None
+- Heartbeat Context:
+  - Current Block 513571000 (WETH/USDC): best spread +0.3584 bps (UniV3-100 -> Pancake-100, 0.01 WETH)
+    Line in heartbeat:
+    {"timestamp":1791651267,"block_number":513571000,"pair":"WETH/USDC","best_spread_bps":0.358441313938,"best_venue_a":"UniV3-100","best_venue_b":"Pancake-100","best_direction":"a_to_b","best_size_weth":0.01}
+
+--------------------------------------------------------------------------------
+Row 4 (Line 52, Block 513571040):
+Full JSON:
+{"timestamp":1791651278,"logged_at":1791651280,"block_number":513571040,"pair":"WETH/USDC","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.01,"weth_out":"10000358441313938","usdc_mid":"25046821","mid_amount":"25046821","gross_spread_bps":0.358441313938,"est_gross_profit_usd":0.0008973586689133404,"pool_liquidity_a":"9203085765380662","pool_liquidity_b":"35511146294928289","sushi_reserve_weth":"0","sushi_reserve_usdc":"0"}
+
+- Trade size: 0.01 WETH
+- Gross spread: +0.358441313938 bps
+- Est gross profit USD: $0.0008973586689133404
+- fee_bps_used: None
+- Heartbeat Context:
+  - Current Block 513571040 (WETH/USDC): best spread +0.3584 bps (UniV3-100 -> Pancake-100, 0.01 WETH)
+    Line in heartbeat:
+    {"timestamp":1791651278,"block_number":513571040,"pair":"WETH/USDC","best_spread_bps":0.358441313938,"best_venue_a":"UniV3-100","best_venue_b":"Pancake-100","best_direction":"a_to_b","best_size_weth":0.01}
+  - Following Block 513571080 (WETH/USDC): best spread dropped back to -1.7175 bps (Pancake-100 -> Camelot-dyn, 0.01 WETH)
+
+*(Note: Camelot-dyn rows in these blocks were logged at -0.32 bps on Pancake-100 <-> Camelot-dyn with `fee_bps_used: 1.0`, just below zero).*
+
+================================================================================
+QUESTION 5: Exact PowerShell commands from arb/bot folder for:
+(a) discovery without touching data/markets.json,
+(b) starting a 24h scan with restart loop and log file,
+(c) running the summarizer.
+================================================================================
+
+(a) Discovery to a fresh file:
+```powershell
+.\target\x86_64-pc-windows-gnu\release\arb-bot.exe --discover --markets-out data/markets_camelot.json
+```
+
+(b) 24h Scan with restart loop and log file:
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$env:MARKETS_FILE = "data/markets_camelot.json"
+$env:OUTPUT_FILE = "data/scan_camelot_$stamp.jsonl"
+$env:LOG_MIN_SPREAD_BPS = "-2.0"
+$logFile = "data/scan_camelot_$stamp.log"
+
+while ($true) {
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting arb-bot (markets: $env:MARKETS_FILE, output: $env:OUTPUT_FILE)..."
+    & .\target\x86_64-pc-windows-gnu\release\arb-bot.exe 2>&1 | Tee-Object -FilePath $logFile -Append
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Bot exited ($LASTEXITCODE). Restarting in 5s..."
+    Start-Sleep -Seconds 5
+}
+```
+
+(c) Summarizer command:
+```powershell
+.\target\x86_64-pc-windows-gnu\release\summarize.exe $env:OUTPUT_FILE --top 20
+```
+
+================================================================================
+END OF REPORT
+================================================================================

@@ -136,6 +136,32 @@ pub const SUSHI_V2_PAIR_INIT_CODE_HASH: &str =
 /// Reserves at query time: ~0.324 WETH / ~$874 USDC (shallow pool — factor in when sizing trades).
 pub const SUSHI_V2_WETH_USDC_PAIR: &str = "0x57b85FEf094e10b5eeCDF350Af688299E9553378";
 
+// ── Camelot V3 (Algebra) ──────────────────────────────────────────────────────
+
+/// Camelot V3 (Algebra) Factory on Arbitrum One — used to discover pool addresses via `poolByPair`.
+/// Source: https://docs.camelot.exchange/contracts-and-integrations/v3-protocol/algebra-contracts
+/// Arbiscan: https://arbiscan.io/address/0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B#code
+/// On-chain verified 2026-10-10 (Phase 2h):
+///   Contract Name: AlgebraFactory (Algebra V1.9)
+///   Bytecode size: 14,031 bytes
+///   poolByPair(WETH, USDC) -> 0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526
+pub const CAMELOT_V3_FACTORY: &str = "0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B";
+
+/// Camelot V3 (Algebra) Quoter on Arbitrum One — used for off-chain price quotes.
+/// Source: https://docs.camelot.exchange/contracts-and-integrations/v3-protocol/algebra-contracts
+/// Arbiscan: https://arbiscan.io/address/0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E#code
+/// On-chain verified 2026-10-10 (Phase 2h):
+///   Contract Name: Quoter (Algebra V1.9)
+///   Bytecode size: 5,112 bytes
+///   ABI: quoteExactInputSingle(address,address,uint256,uint160)(uint256 amountOut, uint16 fee)
+pub const CAMELOT_V3_QUOTER: &str = "0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E";
+
+/// Camelot V3 (Algebra) WETH/USDC pool on Arbitrum One.
+/// Source: factory.poolByPair(WETH, native USDC) called on 2026-10-10.
+/// Arbiscan: https://arbiscan.io/address/0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526#code
+/// Bytecode size: 22,689 bytes (AlgebraPool)
+pub const CAMELOT_V3_WETH_USDC_POOL: &str = "0xB1026b8e7276e7AC75410F1fcbbe21796e8f7526";
+
 // ── Chain ─────────────────────────────────────────────────────────────────────
 
 /// Arbitrum One chain ID.
