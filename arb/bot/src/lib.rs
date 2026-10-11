@@ -4,6 +4,7 @@ pub mod config;
 pub mod constants;
 pub mod discover;
 pub mod executor;
+pub mod gas;
 pub mod logging;
 pub mod multicall;
 pub mod pricing;

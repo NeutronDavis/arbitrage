@@ -60,6 +60,16 @@ pub struct Config {
     pub heartbeat_file: String,
     /// Path for the stats snapshot JSON file. Default: output_file + ".stats.json".
     pub stats_file: String,
+    /// Minimum gross spread in bps to trigger a size probe. Default is -0.5 bps.
+    pub size_probe_min_bps: f64,
+    /// Path for the size probes JSONL file. Default: output_file + ".probes.jsonl".
+    pub probes_file: String,
+    /// Assumed L2 gas execution units. Default is 500,000.
+    pub gas_units_assumed: u64,
+    /// Assumed representative calldata length in bytes. Default is 1,000.
+    pub calldata_bytes_assumed: usize,
+    /// Flash loan fee percentage in basis points. Default is 0.0 bps (matches Balancer on-chain).
+    pub flash_loan_fee_bps: f64,
     /// Watchdog timeout in seconds. If no sampled block is processed for this long,
     /// the bot logs an ERROR and exits with a non-zero code. Default is 90 seconds.
     pub watchdog_secs: u64,
@@ -78,6 +88,11 @@ impl std::fmt::Debug for Config {
             .field("log_min_spread_bps", &self.log_min_spread_bps)
             .field("heartbeat_file", &self.heartbeat_file)
             .field("stats_file", &self.stats_file)
+            .field("size_probe_min_bps", &self.size_probe_min_bps)
+            .field("probes_file", &self.probes_file)
+            .field("gas_units_assumed", &self.gas_units_assumed)
+            .field("calldata_bytes_assumed", &self.calldata_bytes_assumed)
+            .field("flash_loan_fee_bps", &self.flash_loan_fee_bps)
             .field("watchdog_secs", &self.watchdog_secs)
             .finish()
     }
@@ -210,6 +225,33 @@ impl Config {
         let stats_file = std::env::var("STATS_FILE")
             .unwrap_or_else(|_| format!("{}.stats.json", output_file));
 
+        let size_probe_min_bps: f64 = std::env::var("SIZE_PROBE_MIN_BPS")
+            .unwrap_or_else(|_| "-0.5".into())
+            .trim()
+            .parse()
+            .context("SIZE_PROBE_MIN_BPS must be a valid float")?;
+
+        let probes_file = std::env::var("PROBES_FILE")
+            .unwrap_or_else(|_| format!("{}.probes.jsonl", output_file));
+
+        let gas_units_assumed: u64 = std::env::var("GAS_UNITS_ASSUMED")
+            .unwrap_or_else(|_| "500000".into())
+            .trim()
+            .parse()
+            .context("GAS_UNITS_ASSUMED must be a positive integer")?;
+
+        let calldata_bytes_assumed: usize = std::env::var("CALLDATA_BYTES_ASSUMED")
+            .unwrap_or_else(|_| "1000".into())
+            .trim()
+            .parse()
+            .context("CALLDATA_BYTES_ASSUMED must be a positive integer")?;
+
+        let flash_loan_fee_bps: f64 = std::env::var("FLASH_LOAN_FEE_BPS")
+            .unwrap_or_else(|_| "0.0".into())
+            .trim()
+            .parse()
+            .context("FLASH_LOAN_FEE_BPS must be a valid float")?;
+
         let watchdog_secs: u64 = std::env::var("WATCHDOG_SECS")
             .unwrap_or_else(|_| "90".into())
             .trim()
@@ -231,6 +273,11 @@ impl Config {
             log_min_spread_bps,
             heartbeat_file,
             stats_file,
+            size_probe_min_bps,
+            probes_file,
+            gas_units_assumed,
+            calldata_bytes_assumed,
+            flash_loan_fee_bps,
             watchdog_secs,
         })
     }

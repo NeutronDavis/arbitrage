@@ -476,11 +476,11 @@ pub fn summarize_heartbeat_records(
     out
 }
 
-/// Comprehensive summariser reading the rows file, heartbeat file, and stats snapshot file.
+/// Comprehensive summariser reading the rows file, heartbeat file, stats snapshot file, and probes file.
 pub fn summarize_from_paths<P: AsRef<Path>>(
     rows_path: P,
     usd_min: f64,
-) -> Result<(Vec<GroupStats>, Vec<MarketHeartbeatSummary>)> {
+) -> Result<(Vec<GroupStats>, Vec<MarketHeartbeatSummary>, Vec<RouteProbeSummary>)> {
     let rows_path = rows_path.as_ref();
     let path_str = rows_path.to_string_lossy().to_string();
 
@@ -508,7 +508,35 @@ pub fn summarize_from_paths<P: AsRef<Path>>(
         .into_iter()
         .find(|p| !p.is_empty() && Path::new(p).exists());
 
-    // 3. Load heartbeat records
+    // 3. Locate probes file
+    let probes_candidates = [
+        format!("{}.probes.jsonl", path_str),
+        path_str
+            .strip_suffix(".jsonl")
+            .map(|b| format!("{}.probes.jsonl", b))
+            .unwrap_or_default(),
+    ];
+    let probes_path = probes_candidates
+        .into_iter()
+        .find(|p| !p.is_empty() && Path::new(p).exists());
+
+    let mut probe_records = Vec::new();
+    if let Some(ref pp) = probes_path {
+        if let Ok(file) = std::fs::File::open(pp) {
+            let reader = std::io::BufReader::new(file);
+            for l in reader.lines().map_while(Result::ok) {
+                let trimmed = l.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(pr) = serde_json::from_str::<crate::strategy::ProbeRecord>(trimmed) {
+                        probe_records.push(pr);
+                    }
+                }
+            }
+        }
+    }
+    let route_probe_summaries = summarize_probe_records(&probe_records);
+
+    // 4. Load heartbeat records
     let mut heartbeat_records = Vec::new();
     let mut processed_blocks = BTreeSet::new();
 
@@ -528,10 +556,10 @@ pub fn summarize_from_paths<P: AsRef<Path>>(
     }
     let market_summaries = summarize_heartbeat_records(&heartbeat_records);
 
-    // 4. Load stats snapshot if available
+    // 5. Load stats snapshot if available
     let stats_snapshot = stats_path.as_ref().map(StatsSnapshot::load_or_default);
 
-    // 5. Read rows file
+    // 6. Read rows file
     let file = std::fs::File::open(rows_path)
         .with_context(|| format!("Cannot open JSONL file: {:?}", rows_path))?;
     let reader = std::io::BufReader::new(file);
@@ -701,7 +729,96 @@ pub fn summarize_from_paths<P: AsRef<Path>>(
         });
     }
 
-    Ok((out, market_summaries))
+    Ok((out, market_summaries, route_probe_summaries))
+}
+
+/// Summary metrics for a probed route across ladder sizes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteProbeSummary {
+    pub route: String,
+    pub pair: String,
+    pub venues: String,
+    pub direction: String,
+    pub probe_count: u64,
+    pub best_size_weth: f64,
+    pub max_best_profit_usd: f64,
+    pub max_net_profit_usd: f64,
+    pub net_positive_count: u64,
+}
+
+/// Group and aggregate probe records by route.
+pub fn summarize_probe_records(probes: &[crate::strategy::ProbeRecord]) -> Vec<RouteProbeSummary> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, RouteProbeSummary> = BTreeMap::new();
+
+    for p in probes {
+        let route_key = format!("{} {} ({})", p.pair, p.venues, p.direction);
+        let entry = map.entry(route_key.clone()).or_insert_with(|| RouteProbeSummary {
+            route: route_key,
+            pair: p.pair.clone(),
+            venues: p.venues.clone(),
+            direction: p.direction.clone(),
+            probe_count: 0,
+            best_size_weth: p.best_size_weth,
+            max_best_profit_usd: f64::NEG_INFINITY,
+            max_net_profit_usd: f64::NEG_INFINITY,
+            net_positive_count: 0,
+        });
+
+        entry.probe_count += 1;
+        if p.best_profit_usd > entry.max_best_profit_usd {
+            entry.max_best_profit_usd = p.best_profit_usd;
+        }
+        if p.net_profit_usd > entry.max_net_profit_usd {
+            entry.max_net_profit_usd = p.net_profit_usd;
+            entry.best_size_weth = p.best_size_weth;
+        }
+        if p.net_profit_usd > 0.0 {
+            entry.net_positive_count += 1;
+        }
+    }
+
+    let mut out: Vec<RouteProbeSummary> = map.into_values().collect();
+    out.sort_by(|a, b| b.max_net_profit_usd.partial_cmp(&a.max_net_profit_usd).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// Print formatted table of probed routes, showing profit potential and net profit after gas and fees.
+pub fn print_probe_summary_table(summaries: &[RouteProbeSummary]) {
+    if summaries.is_empty() {
+        return;
+    }
+
+    println!("\n══ Probed Routes Summary (from Probes Log) ══");
+    println!("* Assumptions: GAS_UNITS_ASSUMED=500000 | CALLDATA_BYTES_ASSUMED=1000 | FLASH_LOAN_FEE_BPS=0.0 (Balancer V2 Vault on-chain reading: 0.0 bps)");
+    println!(
+        "{:<45} {:>7} {:>12} {:>16} {:>14} {:>14}",
+        "Route", "Probes", "Best Size(W)", "Max Gross USD", "Max Net USD", "Net > 0"
+    );
+    println!("{:-<114}", "");
+
+    for s in summaries {
+        let net_pct = if s.probe_count > 0 {
+            (s.net_positive_count as f64 / s.probe_count as f64) * 100.0
+        } else {
+            0.0
+        };
+        let net_pos_str = format!("{} ({:.1}%)", s.net_positive_count, net_pct);
+        let gross_sign = if s.max_best_profit_usd >= 0.0 { "+" } else { "" };
+        let net_sign = if s.max_net_profit_usd >= 0.0 { "+" } else { "" };
+
+        println!(
+            "{:<45} {:>7} {:>12.3} {:>15}{:.4} {:>13}{:.4} {:>14}",
+            s.route,
+            s.probe_count,
+            s.best_size_weth,
+            gross_sign,
+            s.max_best_profit_usd,
+            net_sign,
+            s.max_net_profit_usd,
+            net_pos_str
+        );
+    }
 }
 
 /// Print formatted per-market table from the heartbeat log.
@@ -1054,7 +1171,7 @@ mod tests {
         snap.record_sample("WETH/USDC", "UniV3-500", "Pancake-100", "a_to_b", 0.05, 0.8);
         snap.save_atomic(&stats_path).expect("write stats");
 
-        let (stats, hb_summaries) = summarize_from_paths(&rows_path, 0.01).expect("summarize from paths");
+        let (stats, hb_summaries, _) = summarize_from_paths(&rows_path, 0.01).expect("summarize from paths");
         assert_eq!(stats.len(), 1);
         let g = &stats[0];
         assert_eq!(g.blocks_seen, 4);
@@ -1092,14 +1209,14 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
 
-        // Legacy format without companion heartbeat or stats files
+        // Legacy format without companion heartbeat, stats or probes files
         let legacy_content = r#"
 {"block_number":100,"pair":"WETH/USDC","venue_a":"UniV3-500","venue_b":"SushiV2","direction":"a_to_b","size_weth":0.01,"gross_spread_bps":-2.0}
 {"block_number":140,"pair":"WETH/USDC","venue_a":"UniV3-500","venue_b":"SushiV2","direction":"a_to_b","size_weth":0.01,"gross_spread_bps":1.5}
 "#;
         std::fs::write(&rows_path, legacy_content.trim()).expect("write legacy");
 
-        let (stats, hb_summaries) = summarize_from_paths(&rows_path, 0.01).expect("summarize old format");
+        let (stats, hb_summaries, probe_summaries) = summarize_from_paths(&rows_path, 0.01).expect("summarize old format");
         assert_eq!(stats.len(), 1);
         let g = &stats[0];
         assert_eq!(g.blocks_seen, 2);
@@ -1107,6 +1224,7 @@ mod tests {
         assert_eq!(g.positive_count, 1);
         assert!(!g.is_approximate); // exact from rows
         assert_eq!(hb_summaries.len(), 0); // no heartbeat file
+        assert_eq!(probe_summaries.len(), 0); // no probes file
 
         let _ = std::fs::remove_file(&rows_path);
     }
@@ -1143,7 +1261,7 @@ mod tests {
 "#;
         std::fs::write(&rows_path, rows_content.trim()).expect("write rows");
 
-        let (stats, hb_summaries) = summarize_from_paths(&rows_path, 0.01).expect("summarize from paths");
+        let (stats, hb_summaries, _) = summarize_from_paths(&rows_path, 0.01).expect("summarize from paths");
         assert_eq!(stats.len(), 1);
         let g = &stats[0];
 
@@ -1157,5 +1275,36 @@ mod tests {
         let _ = std::fs::remove_file(&rows_path);
         let _ = std::fs::remove_file(&hb_path);
         let _ = std::fs::remove_file(&stats_path);
+    }
+
+    #[test]
+    fn test_probe_summarizer_with_fixture() {
+        let temp_dir = std::env::temp_dir();
+        let id = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let rows_path = temp_dir.join(format!("test_probes_{}.jsonl", id));
+        let probes_path = temp_dir.join(format!("test_probes_{}.jsonl.probes.jsonl", id));
+
+        let rows_content = r#"
+{"block_number":10,"pair":"WETH/USDC","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","size_weth":0.01,"gross_spread_bps":0.35}
+"#;
+        std::fs::write(&rows_path, rows_content.trim()).expect("write rows");
+
+        let probes_content = r#"
+{"timestamp":1000,"block_number":10,"pair":"WETH/USDC","venues":"UniV3-100 -> Pancake-100","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","ladder":[{"size_weth":0.01,"spread_bps":0.35,"profit_weth":0.00000035,"profit_usd":0.000875}],"best_size_weth":0.01,"best_profit_weth":0.00000035,"best_profit_usd":0.000875,"l2_gas_usd":0.025,"l1_data_fee_usd":0.00002,"gas_usd":0.02502,"flash_fee_usd":0.0,"net_profit_usd":-0.024145}
+{"timestamp":1010,"block_number":11,"pair":"WETH/USDC","venues":"UniV3-100 -> Pancake-100","venue_a":"UniV3-100","venue_b":"Pancake-100","direction":"a_to_b","ladder":[{"size_weth":0.05,"spread_bps":1.20,"profit_weth":0.00000600,"profit_usd":0.035000}],"best_size_weth":0.05,"best_profit_weth":0.00000600,"best_profit_usd":0.035000,"l2_gas_usd":0.025,"l1_data_fee_usd":0.00002,"gas_usd":0.02502,"flash_fee_usd":0.0,"net_profit_usd":0.009980}
+"#;
+        std::fs::write(&probes_path, probes_content.trim()).expect("write probes");
+
+        let (_, _, probe_summaries) = summarize_from_paths(&rows_path, 0.01).expect("summarize probes");
+        assert_eq!(probe_summaries.len(), 1);
+        let ps = &probe_summaries[0];
+        assert_eq!(ps.probe_count, 2);
+        assert_eq!(ps.best_size_weth, 0.05); // size that achieved max net profit
+        assert!((ps.max_best_profit_usd - 0.0350).abs() < 1e-6);
+        assert!((ps.max_net_profit_usd - 0.00998).abs() < 1e-6);
+        assert_eq!(ps.net_positive_count, 1);
+
+        let _ = std::fs::remove_file(&rows_path);
+        let _ = std::fs::remove_file(&probes_path);
     }
 }

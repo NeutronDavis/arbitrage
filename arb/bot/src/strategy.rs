@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 
+use crate::multicall;
 use crate::pricing::sushi_v2::Reserves;
 use crate::pricing::uniswap_v3::{self, Side, V3Pool};
 use crate::pricing::weth_to_raw;
@@ -892,6 +893,315 @@ pub fn append_jsonl(path: &str, records: &[OpportunityRecord]) -> Result<()> {
     Ok(())
 }
 
+// ── Size Probe Ladder & Telemetry (Phase 3a) ──────────────────────────────────
+
+/// Standard ladder of sizes quoted when a route meets `SIZE_PROBE_MIN_BPS`.
+pub const PROBE_LADDER_SIZES_WETH: [f64; 9] = [
+    0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
+];
+
+/// One point on a size probe ladder.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+pub struct ProbeLadderPoint {
+    pub size_weth: f64,
+    pub spread_bps: f64,
+    pub profit_weth: f64,
+    pub profit_usd: f64,
+}
+
+/// One probe record written to `<OUTPUT_FILE>.probes.jsonl` when an opportunity
+/// meets `SIZE_PROBE_MIN_BPS`.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+pub struct ProbeRecord {
+    pub timestamp: u64,
+    pub block_number: u64,
+    pub pair: String,
+    pub venues: String,
+    pub venue_a: String,
+    pub venue_b: String,
+    pub direction: String,
+    pub ladder: Vec<ProbeLadderPoint>,
+    pub best_size_weth: f64,
+    pub best_profit_weth: f64,
+    pub best_profit_usd: f64,
+    pub l2_gas_usd: f64,
+    pub l1_data_fee_usd: f64,
+    pub gas_usd: f64,
+    pub flash_fee_usd: f64,
+    pub net_profit_usd: f64,
+}
+
+/// Append probe records to a JSONL file, flushing immediately.
+pub fn append_probes_jsonl(path: &str, probes: &[ProbeRecord]) -> Result<()> {
+    use std::io::Write;
+    if probes.is_empty() {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Cannot open probes file: {path}"))?;
+
+    for p in probes {
+        let line = serde_json::to_string(p)
+            .context("Failed to serialise probe record")?;
+        writeln!(file, "{line}").with_context(|| format!("Probe write failed: {path}"))?;
+    }
+    file.flush().with_context(|| format!("Probe flush failed: {path}"))?;
+    Ok(())
+}
+
+/// Execute size probes across all qualifying routes in a block.
+pub async fn probe_qualifying_routes(
+    http: &crate::provider::HttpProvider,
+    markets: &[MarketSetup],
+    records: &[OpportunityRecord],
+    state: &MarketState,
+    eth_usd_price: f64,
+    size_probe_min_bps: f64,
+    gas_model: &crate::gas::GasModel,
+) -> Result<Vec<ProbeRecord>> {
+    use std::collections::HashSet;
+    let mut seen_routes = HashSet::new();
+    let mut qualifying = Vec::new();
+
+    for r in records {
+        if r.gross_spread_bps >= size_probe_min_bps {
+            let key = (
+                r.pair.clone(),
+                r.venue_a.clone(),
+                r.venue_b.clone(),
+                r.direction.clone(),
+            );
+            if seen_routes.insert(key) {
+                qualifying.push(r.clone());
+            }
+        }
+    }
+
+    if qualifying.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let weth_addr: Address = crate::constants::WETH.parse()?;
+
+    struct RouteProbeInfo {
+        record: OpportunityRecord,
+        source_venue: Venue,
+        dest_venue: Venue,
+        quote_token: Address,
+        pool_a: Option<V3Pool>,
+        pool_b: Option<V3Pool>,
+    }
+
+    let mut route_infos = Vec::new();
+    for r in qualifying {
+        let m = match markets.iter().find(|m| m.config.pair == r.pair) {
+            Some(m) => m,
+            None => continue,
+        };
+        let v_a: Venue = match r.venue_a.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let v_b: Venue = match r.venue_b.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let (source_venue, dest_venue) = if r.direction == "a_to_b" {
+            (v_a, v_b)
+        } else {
+            (v_b, v_a)
+        };
+        let pool_a = m.pools.iter().find(|p| p.venue == source_venue).cloned();
+        let pool_b = m.pools.iter().find(|p| p.venue == dest_venue).cloned();
+
+        route_infos.push(RouteProbeInfo {
+            record: r,
+            source_venue,
+            dest_venue,
+            quote_token: m.config.quote_token,
+            pool_a,
+            pool_b,
+        });
+    }
+
+    if route_infos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // ── Batch A: Leg 1 for each route and ladder size ──────────────────────────
+    let mut batch_a = Vec::new();
+    let mut batch_a_meta = Vec::new();
+    let mut mid_amounts: Vec<Vec<u128>> = vec![vec![0; PROBE_LADDER_SIZES_WETH.len()]; route_infos.len()];
+
+    for (r_idx, info) in route_infos.iter().enumerate() {
+        for (s_idx, &size) in PROBE_LADDER_SIZES_WETH.iter().enumerate() {
+            let weth_in = weth_to_raw(size);
+            if info.source_venue == Venue::SushiV2 {
+                if let Some(ref sushi) = state.sushi {
+                    let usdc_out = sushi.weth_to_usdc(weth_in);
+                    mid_amounts[r_idx][s_idx] = usdc_out;
+                }
+            } else if let Some(ref p) = info.pool_a {
+                let call = match p.venue {
+                    Venue::CamelotV3 => crate::pricing::camelot_v3::build_quote_call(
+                        p.quoter,
+                        weth_addr,
+                        info.quote_token,
+                        U256::from(weth_in),
+                    )?,
+                    _ => uniswap_v3::build_quote_call(
+                        p.quoter,
+                        p.fee,
+                        weth_addr,
+                        info.quote_token,
+                        U256::from(weth_in),
+                    )?,
+                };
+                batch_a.push(call);
+                batch_a_meta.push((r_idx, s_idx, p.venue));
+            }
+        }
+    }
+
+    if !batch_a.is_empty() {
+        let (res_a, _) = multicall::aggregate3_chunked(
+            http,
+            batch_a,
+            state.block,
+            multicall::DEFAULT_CHUNK_SIZE,
+        ).await?;
+
+        for (i, (r_idx, s_idx, venue)) in batch_a_meta.into_iter().enumerate() {
+            let out = match venue {
+                Venue::CamelotV3 => crate::pricing::camelot_v3::decode_quote_result(&res_a[i])
+                    .map(|(out, _fee)| out.to::<u128>()),
+                _ => uniswap_v3::decode_quote_result(&res_a[i])
+                    .map(|(out, _gas)| out.to::<u128>()),
+            };
+            if let Some(val) = out {
+                mid_amounts[r_idx][s_idx] = val;
+            }
+        }
+    }
+
+    // ── Batch B: Leg 2 for each route and ladder size ──────────────────────────
+    let mut batch_b = Vec::new();
+    let mut batch_b_meta = Vec::new();
+    let mut weth_backs: Vec<Vec<u128>> = vec![vec![0; PROBE_LADDER_SIZES_WETH.len()]; route_infos.len()];
+
+    for (r_idx, info) in route_infos.iter().enumerate() {
+        for (s_idx, _) in PROBE_LADDER_SIZES_WETH.iter().enumerate() {
+            let amount_mid = mid_amounts[r_idx][s_idx];
+            if amount_mid == 0 {
+                continue;
+            }
+            if info.dest_venue == Venue::SushiV2 {
+                if let Some(ref sushi) = state.sushi {
+                    let weth_out = sushi.usdc_to_weth(amount_mid);
+                    weth_backs[r_idx][s_idx] = weth_out;
+                }
+            } else if let Some(ref p) = info.pool_b {
+                let call = match p.venue {
+                    Venue::CamelotV3 => crate::pricing::camelot_v3::build_quote_call(
+                        p.quoter,
+                        info.quote_token,
+                        weth_addr,
+                        U256::from(amount_mid),
+                    )?,
+                    _ => uniswap_v3::build_quote_call(
+                        p.quoter,
+                        p.fee,
+                        info.quote_token,
+                        weth_addr,
+                        U256::from(amount_mid),
+                    )?,
+                };
+                batch_b.push(call);
+                batch_b_meta.push((r_idx, s_idx, p.venue));
+            }
+        }
+    }
+
+    if !batch_b.is_empty() {
+        let (res_b, _) = multicall::aggregate3_chunked(
+            http,
+            batch_b,
+            state.block,
+            multicall::DEFAULT_CHUNK_SIZE,
+        ).await?;
+
+        for (i, (r_idx, s_idx, venue)) in batch_b_meta.into_iter().enumerate() {
+            let out = match venue {
+                Venue::CamelotV3 => crate::pricing::camelot_v3::decode_quote_result(&res_b[i])
+                    .map(|(out, _fee)| out.to::<u128>()),
+                _ => uniswap_v3::decode_quote_result(&res_b[i])
+                    .map(|(out, _gas)| out.to::<u128>()),
+            };
+            if let Some(val) = out {
+                weth_backs[r_idx][s_idx] = val;
+            }
+        }
+    }
+
+    // ── Assemble Probe Records ────────────────────────────────────────────────
+    let mut probe_records = Vec::new();
+    for (r_idx, info) in route_infos.into_iter().enumerate() {
+        let mut ladder = Vec::with_capacity(PROBE_LADDER_SIZES_WETH.len());
+        for (s_idx, &size) in PROBE_LADDER_SIZES_WETH.iter().enumerate() {
+            let weth_in = weth_to_raw(size);
+            let weth_out = weth_backs[r_idx][s_idx];
+            let profit_weth = (weth_out as f64 - weth_in as f64) / 1e18;
+            let spread_bps = gross_spread_bps(weth_in, weth_out);
+            let profit_usd = profit_weth * eth_usd_price;
+            ladder.push(ProbeLadderPoint {
+                size_weth: size,
+                spread_bps,
+                profit_weth,
+                profit_usd,
+            });
+        }
+
+        // Maximise profit in WETH
+        let best_point = ladder
+            .iter()
+            .max_by(|x, y| x.profit_weth.partial_cmp(&y.profit_weth).unwrap_or(std::cmp::Ordering::Equal))
+            .cloned()
+            .unwrap_or_else(|| ProbeLadderPoint {
+                size_weth: 0.01,
+                spread_bps: -10_000.0,
+                profit_weth: 0.0,
+                profit_usd: 0.0,
+            });
+
+        let costs = gas_model.compute_costs(best_point.size_weth, best_point.profit_usd, eth_usd_price);
+        let venues_str = format!("{} -> {}", info.source_venue, info.dest_venue);
+
+        probe_records.push(ProbeRecord {
+            timestamp: info.record.timestamp,
+            block_number: info.record.block_number,
+            pair: info.record.pair,
+            venues: venues_str,
+            venue_a: info.record.venue_a,
+            venue_b: info.record.venue_b,
+            direction: info.record.direction,
+            ladder,
+            best_size_weth: best_point.size_weth,
+            best_profit_weth: best_point.profit_weth,
+            best_profit_usd: best_point.profit_usd,
+            l2_gas_usd: costs.l2_gas_usd,
+            l1_data_fee_usd: costs.l1_data_fee_usd,
+            gas_usd: costs.total_gas_usd,
+            flash_fee_usd: costs.flash_fee_usd,
+            net_profit_usd: costs.net_profit_usd,
+        });
+    }
+
+    Ok(probe_records)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1280,6 +1590,68 @@ mod tests {
     fn test_venue_camelot_dyn_parsing_and_display() {
         assert_eq!("Camelot-dyn".parse::<Venue>().unwrap(), Venue::CamelotV3);
         assert_eq!(Venue::CamelotV3.to_string(), "Camelot-dyn");
+    }
+
+    #[test]
+    fn test_probe_ladder_maximization_on_fixture() {
+        // A fixture of ladder points where a larger trade with a lower spread in bps
+        // generates greater total profit in WETH than a smaller trade with higher bps.
+        let ladder = vec![
+            ProbeLadderPoint { size_weth: 0.005, spread_bps: 1.0,  profit_weth: 0.0000005, profit_usd: 0.00125 },
+            ProbeLadderPoint { size_weth: 0.01,  spread_bps: 2.0,  profit_weth: 0.0000020, profit_usd: 0.00500 }, // highest bps
+            ProbeLadderPoint { size_weth: 0.02,  spread_bps: 1.5,  profit_weth: 0.0000030, profit_usd: 0.00750 },
+            ProbeLadderPoint { size_weth: 0.05,  spread_bps: 1.2,  profit_weth: 0.0000060, profit_usd: 0.01500 },
+            ProbeLadderPoint { size_weth: 0.1,   spread_bps: 1.0,  profit_weth: 0.0000100, profit_usd: 0.02500 },
+            ProbeLadderPoint { size_weth: 0.25,  spread_bps: 0.8,  profit_weth: 0.0000200, profit_usd: 0.05000 },
+            ProbeLadderPoint { size_weth: 0.5,   spread_bps: 0.6,  profit_weth: 0.0000300, profit_usd: 0.07500 }, // MAXIMUM WETH profit
+            ProbeLadderPoint { size_weth: 1.0,   spread_bps: 0.1,  profit_weth: 0.0000100, profit_usd: 0.02500 },
+            ProbeLadderPoint { size_weth: 2.0,   spread_bps: -0.5, profit_weth: -0.0001000, profit_usd: -0.2500 },
+        ];
+
+        let best = ladder
+            .iter()
+            .max_by(|x, y| x.profit_weth.partial_cmp(&y.profit_weth).unwrap())
+            .unwrap();
+
+        // Must pick 0.5 WETH (0.0000300 WETH profit), NOT 0.01 WETH (2.0 bps)
+        assert_eq!(best.size_weth, 0.5);
+        assert_eq!(best.profit_weth, 0.0000300);
+        assert_eq!(best.spread_bps, 0.6);
+    }
+
+    #[test]
+    fn test_probe_record_serialization_and_roundtrip() {
+        let probe = ProbeRecord {
+            timestamp: 1791651244,
+            block_number: 513570920,
+            pair: "WETH/USDC".into(),
+            venues: "UniV3-100 -> Pancake-100".into(),
+            venue_a: "UniV3-100".into(),
+            venue_b: "Pancake-100".into(),
+            direction: "a_to_b".into(),
+            ladder: vec![ProbeLadderPoint {
+                size_weth: 0.01,
+                spread_bps: 0.32,
+                profit_weth: 0.00000032,
+                profit_usd: 0.0008,
+            }],
+            best_size_weth: 0.01,
+            best_profit_weth: 0.00000032,
+            best_profit_usd: 0.0008,
+            l2_gas_usd: 0.025,
+            l1_data_fee_usd: 0.00002,
+            gas_usd: 0.02502,
+            flash_fee_usd: 0.0,
+            net_profit_usd: -0.02422,
+        };
+
+        let json = serde_json::to_string(&probe).expect("serialize probe");
+        let parsed: ProbeRecord = serde_json::from_str(&json).expect("deserialize probe");
+        assert_eq!(parsed.block_number, 513570920);
+        assert_eq!(parsed.venues, "UniV3-100 -> Pancake-100");
+        assert_eq!(parsed.best_size_weth, 0.01);
+        assert_eq!(parsed.ladder.len(), 1);
+        assert!((parsed.net_profit_usd - (-0.02422)).abs() < 1e-6);
     }
 }
 

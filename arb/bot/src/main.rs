@@ -19,6 +19,7 @@ mod config;
 mod constants;
 mod discover;
 mod executor;
+mod gas;
 mod logging;
 mod multicall;
 mod pricing;
@@ -77,6 +78,11 @@ struct Ctx {
     heartbeat_file: String,
     stats_file: String,
     log_min_spread_bps: f64,
+    size_probe_min_bps: f64,
+    probes_file: String,
+    gas_units_assumed: u64,
+    calldata_bytes_assumed: usize,
+    flash_loan_fee_bps: f64,
     stats: std::sync::Arc<tokio::sync::Mutex<summary::StatsSnapshot>>,
 }
 
@@ -99,11 +105,12 @@ async fn run() -> Result<()> {
     // If --summarize is requested, run analysis and exit immediately without RPC connection.
     if let Some(path_opt) = args.summarize {
         let path = path_opt.unwrap_or_else(|| "data/opportunities.jsonl".into());
-        let (stats, hb_summaries) = summary::summarize_from_paths(Path::new(&path), args.usd_min)
+        let (stats, hb_summaries, probe_summaries) = summary::summarize_from_paths(Path::new(&path), args.usd_min)
             .with_context(|| format!("Cannot summarise file: {path}"))?;
         println!("File: {path}");
         summary::print_summary(&stats, args.top, args.usd_min);
         summary::print_market_heartbeat_table(&hb_summaries);
+        summary::print_probe_summary_table(&probe_summaries);
         return Ok(());
     }
 
@@ -168,7 +175,7 @@ async fn run() -> Result<()> {
     }
 
     // Ensure output directories exist.
-    for path in [&cfg.output_file, &cfg.heartbeat_file, &cfg.stats_file] {
+    for path in [&cfg.output_file, &cfg.heartbeat_file, &cfg.stats_file, &cfg.probes_file] {
         if let Some(parent) = Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -177,14 +184,42 @@ async fn run() -> Result<()> {
         }
     }
 
+    // Read on-chain Balancer Vault flash loan fee and WETH balance
+    let flash_loan_fee_bps = match gas::query_balancer_status(&http).await {
+        Ok(status) => {
+            info!(
+                vault = %status.vault_address,
+                collector = %status.collector_address,
+                fee_bps = status.flash_loan_fee_bps,
+                weth_balance = status.weth_balance_f64,
+                paused = status.is_paused,
+                "Balancer Vault on-chain status checked"
+            );
+            if std::env::var("FLASH_LOAN_FEE_BPS").is_ok() {
+                cfg.flash_loan_fee_bps
+            } else {
+                status.flash_loan_fee_bps
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to query Balancer Vault on-chain status, using configured/default fee");
+            cfg.flash_loan_fee_bps
+        }
+    };
+
     let calls = rpc_calls_per_block();
     info!(
         rpc_calls_per_processed_block = calls,
         log_every_n_blocks = cfg.log_every_n_blocks,
         markets = cfg.markets.len(),
         log_min_spread_bps = cfg.log_min_spread_bps,
+        size_probe_min_bps = cfg.size_probe_min_bps,
         heartbeat_file = %cfg.heartbeat_file,
         stats_file = %cfg.stats_file,
+        probes_file = %cfg.probes_file,
+        gas_units_assumed = cfg.gas_units_assumed,
+        calldata_bytes_assumed = cfg.calldata_bytes_assumed,
+        flash_loan_fee_bps,
         "RPC budget and logging thresholds (Multicall3 batched)"
     );
 
@@ -198,6 +233,11 @@ async fn run() -> Result<()> {
         heartbeat_file: cfg.heartbeat_file.clone(),
         stats_file: cfg.stats_file.clone(),
         log_min_spread_bps: cfg.log_min_spread_bps,
+        size_probe_min_bps: cfg.size_probe_min_bps,
+        probes_file: cfg.probes_file.clone(),
+        gas_units_assumed: cfg.gas_units_assumed,
+        calldata_bytes_assumed: cfg.calldata_bytes_assumed,
+        flash_loan_fee_bps,
         stats,
     };
 
@@ -400,6 +440,31 @@ async fn process_block(
     let filtered_records = strategy::filter_records_by_threshold(&records, ctx.log_min_spread_bps);
     strategy::append_jsonl(&ctx.output_file, &filtered_records)?;
 
+    // 4. Size probes for routes meeting SIZE_PROBE_MIN_BPS
+    let l2_gas_price = gas::query_l2_gas_price(http).await.unwrap_or(20_000_000);
+    let l1_fee_wei = gas::query_l1_data_fee_estimate(http, ctx.calldata_bytes_assumed).await.unwrap_or(7_240_000_000);
+    let gas_model = gas::GasModel::new(
+        ctx.gas_units_assumed,
+        ctx.calldata_bytes_assumed,
+        ctx.flash_loan_fee_bps,
+        l2_gas_price,
+        l1_fee_wei,
+    );
+
+    let probes = strategy::probe_qualifying_routes(
+        http,
+        &ctx.markets,
+        &records,
+        &batched.state,
+        batched.eth_usd_price,
+        ctx.size_probe_min_bps,
+        &gas_model,
+    ).await?;
+
+    if !probes.is_empty() {
+        strategy::append_probes_jsonl(&ctx.probes_file, &probes)?;
+    }
+
     let rpc_calls = batched.total_rpc_calls;
 
     info!(
@@ -416,6 +481,7 @@ async fn process_block(
         evaluated = records.len(),
         logged = filtered_records.len(),
         heartbeats = heartbeats.len(),
+        probes = probes.len(),
         best_bps = records.first().map(|r| r.gross_spread_bps).unwrap_or(f64::NAN),
         elapsed_ms = t0.elapsed().as_millis(),
         "Block processed"
@@ -433,6 +499,32 @@ async fn process_block(
 
         print_market_snapshot(&ctx.markets, &batched.state, &batched.first);
         print_spreads_per_market(&records);
+
+        if !probes.is_empty() {
+            println!(
+                "\n══ Probed Routes (Size Ladder >= {:.2} bps) ══",
+                ctx.size_probe_min_bps
+            );
+            for p in &probes {
+                println!(
+                    "  {} (Block {})",
+                    p.venues, p.block_number
+                );
+                println!(
+                    "    Best Size: {:.3} WETH | Best Gross: +${:.5} | Net Profit: ${:.5}",
+                    p.best_size_weth, p.best_profit_usd, p.net_profit_usd
+                );
+                println!(
+                    "    Gas: ${:.5} (L2: ${:.5}, L1: ${:.5}) | Flash Fee: ${:.5}",
+                    p.gas_usd, p.l2_gas_usd, p.l1_data_fee_usd, p.flash_fee_usd
+                );
+                print!("    Ladder:");
+                for pt in &p.ladder {
+                    print!(" [{}W: {:+.2}bps]", pt.size_weth, pt.spread_bps);
+                }
+                println!();
+            }
+        }
 
         println!(
             "\n══ RPC Multicall Metrics (Block {}) ══",

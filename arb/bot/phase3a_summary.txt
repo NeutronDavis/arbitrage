@@ -1,0 +1,218 @@
+================================================================================
+PHASE 3a SUMMARY: PROFIT-POTENTIAL ESTIMATOR (READ-ONLY)
+================================================================================
+Date: 2026-10-10
+Status: COMPLETE & VERIFIED
+
+--------------------------------------------------------------------------------
+1. RULES ADHERENCE
+--------------------------------------------------------------------------------
+- 24-hour scan running from C:\scan writing to data\scan_24h_* was NEVER touched,
+  modified, read, moved, or deleted.
+- No running processes were killed.
+- cargo clean was NEVER run.
+- .env was NEVER read, modified, created, or deleted. No RPC URLs or keys printed.
+- tokens.toml, reviewed flags, and data/markets.json were NEVER edited.
+- Test runs ended on their own (via timeout 300) and used temporary files
+  (data/test_phase3a_live.jsonl*).
+- All contract and precompile addresses were cited from verified documentation
+  and verified on-chain with cast.
+- Route descriptions strictly reflect logged rows (e.g. UniV3-100 -> Pancake-100,
+  Pancake-100 -> Camelot-dyn).
+
+--------------------------------------------------------------------------------
+2. ON-CHAIN VERIFICATIONS & SOURCES (VERIFIED VIA CAST)
+--------------------------------------------------------------------------------
+
+A. Balancer V2 Vault & Flash Loan Fee
+- Vault Address: 0xBA12222222228d8Ba445958a75a0704d566BF2C8
+  Source: Balancer V2 Official Arbitrum Deployment Docs & Arbiscan Verified Contract
+- Query ProtocolFeesCollector:
+  cast call 0xBA12222222228d8Ba445958a75a0704d566BF2C8 "getProtocolFeesCollector()(address)" --rpc-url https://arb1.arbitrum.io/rpc
+  Result: 0xce88686553686DA562CE7Cea497CE749DA109f9F
+- Query Flash Loan Fee Percentage:
+  cast call 0xce88686553686DA562CE7Cea497CE749DA109f9F "getFlashLoanFeePercentage()(uint256)" --rpc-url https://arb1.arbitrum.io/rpc
+  Result: 0 (0 wei = 0.00 bps / 0.00%)
+- Query Balancer Vault WETH Balance:
+  cast call 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1 "balanceOf(address)(uint256)" 0xBA12222222228d8Ba445958a75a0704d566BF2C8 --rpc-url https://arb1.arbitrum.io/rpc
+  Result: 100289669863507201254 wei (~100.289 WETH)
+- Query Balancer Vault Paused State:
+  cast call 0xBA12222222228d8Ba445958a75a0704d566BF2C8 "getPausedState()(bool,uint32,uint32)" --rpc-url https://arb1.arbitrum.io/rpc
+  Result: paused: false, pauseWindowEndTime: 1637617308, bufferPeriodEndTime: 1640209308
+  (Vault is active and not paused; pause and buffer periods expired in 2021)
+- Additional checks available for Balancer:
+  - Vault Authorizer: 0xa331d84ec860bf466b4cdccfb4ac09a1b43f3ae6 (Balancer Governance Authorizer)
+  - Flash loan fee percentage is dynamic and governance-managed via ProtocolFeesCollector.
+  - WETH flash loan availability is bounded by current unallocated Vault balance (~100.29 WETH).
+
+B. Arbitrum L1 Calldata Fee Mechanism
+1. NodeInterface: 0x00000000000000000000000000000000000000C8
+   Function: gasEstimateL1Component(address to, bool contractCreation, bytes calldata data)
+             returns (uint64 gasEstimateForL1, uint256 baseFee, uint256 l1BaseFeeEstimate)
+   cast verification with 1000 bytes dummy calldata:
+   cast call 0x00000000000000000000000000000000000000C8 'gasEstimateL1Component(address,bool,bytes)(uint64,uint256,uint256)' 0x0000000000000000000000000000000000000000 false $(python3 -c "print('00'*1000)") --rpc-url https://arb1.arbitrum.io/rpc
+   Output:
+   - gasEstimateForL1: 296
+   - baseFee: 20070000 wei (~0.02007 gwei)
+   - l1BaseFeeEstimate: 1535365 wei (~0.001535 gwei)
+   - Total L1 fee estimate: 296 * 20070000 = 5,940,720,000 wei (~0.00000594 WETH = ~$0.000015 USD).
+
+2. ArbGasInfo Precompile: 0x000000000000000000000000000000000000006c
+   Function: getPricesInWei()
+             returns (uint256 perL2Tx, uint256 perL1Byte, uint256 perStorageAlloc, uint256 l2BaseFee, uint256 congestionFee, uint256 totalBaseFee)
+   cast call 0x000000000000000000000000000000000000006c "getPricesInWei()(uint256,uint256,uint256,uint256,uint256,uint256)" --rpc-url https://arb1.arbitrum.io/rpc
+   Output:
+   - perL2Tx: 3,439,217,600 wei
+   - perL1Byte: 24,565,840 wei
+   - perStorageAlloc: 403,000,000,000 wei
+   - l2BaseFee: 20,000,000 wei (0.020 gwei)
+   - congestionFee: 150,000 wei
+   - totalBaseFee: 20,150,000 wei
+
+--------------------------------------------------------------------------------
+3. GAS & COST MODEL SPECIFICATION
+--------------------------------------------------------------------------------
+All parameters are configurable via CLI and environment variables, flagged as assumptions:
+- GAS_UNITS_ASSUMED (default: 500,000)
+- CALLDATA_BYTES_ASSUMED (default: 1,000)
+- FLASH_LOAN_FEE_BPS (default: on-chain reading 0.0 bps)
+- SIZE_PROBE_MIN_BPS (default: -0.5 bps)
+
+Formulas:
+  L2 Gas USD = (GAS_UNITS_ASSUMED * l2_gas_price_wei / 1e18) * eth_usd_price
+  L1 Data Fee USD = (l1_data_fee_wei / 1e18) * eth_usd_price
+  Total Gas USD = L2 Gas USD + L1 Data Fee USD
+  Flash Loan Fee USD = (FLASH_LOAN_FEE_BPS / 10,000) * best_size_weth * eth_usd_price
+  Net Profit USD = best_profit_usd - Total Gas USD - Flash Loan Fee USD
+
+--------------------------------------------------------------------------------
+4. SIZE PROBE LADDER OPTIMIZATION
+--------------------------------------------------------------------------------
+When a block row's gross_spread_bps >= SIZE_PROBE_MIN_BPS (-0.5 bps):
+1. A pinned Multicall3 batch is executed on that block height across 9 ladder sizes:
+   [0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0] WETH.
+2. Both legs are quoted on-chain to capture exact depth and price impact.
+3. The size maximizing WETH profit is selected:
+   profit_weth = size_weth * (spread_bps / 10,000)
+4. Gas and flash loan fees are applied to compute net_profit_usd.
+5. Record written to <OUTPUT_FILE>.probes.jsonl.
+
+--------------------------------------------------------------------------------
+5. TEST SUITE & COMPILATION
+--------------------------------------------------------------------------------
+- cargo check --target x86_64-pc-windows-gnu -j 1: CLEAN (0 errors, 0 warnings)
+- cargo clippy --target x86_64-pc-windows-gnu --all-targets -j 1 -- -D warnings: CLEAN (0 errors, 0 warnings)
+- cargo test --target x86_64-pc-windows-gnu -j 1: 47 passed; 0 failed
+  Test breakdown:
+  - lib (arb-bot): 47 passed, 0 failed
+  - bin arb-bot: 47 passed, 0 failed
+  - bin summarize: 0 passed, 0 failed
+  - bin verify_parity: 0 passed, 0 failed
+  Total: 47 unit tests passed
+- cargo build --release --target x86_64-pc-windows-gnu -j 1: BUILT CLEANLY
+
+--------------------------------------------------------------------------------
+6. BOUNDED LIVE TEST (timeout 300)
+--------------------------------------------------------------------------------
+Executed with:
+  OUTPUT_FILE = data/test_phase3a_live.jsonl
+  MARKETS_FILE = data/test_markets_camelot.json (10 markets)
+  LOG_MIN_SPREAD_BPS = -2.0
+  SIZE_PROBE_MIN_BPS = -0.5
+
+Summarizer Output:
+══ Per-Market Best Spread Summary (from Heartbeat) ══
+Pair           Blocks    Min(bps) Median(bps)    Max(bps)   Blocks > -2 bps   Blocks > -1 bps   Blocks > 0 bps
+-----------------------------------------------------------------------------------------------------------
+WETH/AAVE          24      -27.04      -19.94      -19.42        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/ARB           24      -22.48      -17.22      -15.84        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/GMX           24      -60.47      -60.47      -60.47        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/LINK          24      -11.07      -11.07       -8.11        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/PENDLE        24      -46.58      -43.16      -43.16        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/USDC          24       -2.03       -1.05        0.19       21 ( 87.5%)       11 ( 45.8%)       1 (  4.2%)
+WETH/USDC.e        24      -32.00      -32.00      -32.00        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/USDT          24       -5.91       -5.91       -2.31        0 (  0.0%)        0 (  0.0%)       0 (  0.0%)
+WETH/WBTC          24       -1.51       -0.19        2.13       24 (100.0%)       22 ( 91.7%)      10 ( 41.7%)
+WETH/wstETH        24       -1.08       -1.08       -1.08       24 (100.0%)        0 (  0.0%)       0 (  0.0%)
+
+══ Probed Routes Summary (from Probes Log) ══
+* Assumptions: GAS_UNITS_ASSUMED=500000 | CALLDATA_BYTES_ASSUMED=1000 | FLASH_LOAN_FEE_BPS=0.0 (Balancer V2 Vault on-chain reading: 0.0 bps)
+Route                                          Probes Best Size(W)    Max Gross USD    Max Net USD        Net > 0
+------------------------------------------------------------------------------------------------------------------
+WETH/WBTC Pancake-100 -> Camelot-dyn (a_to_b)      22        0.020               +0.0093              -0.0157       0 (0.0%)
+WETH/USDC UniV3-100 -> Pancake-100 (a_to_b)         1        0.005               +0.0007              -0.0245       0 (0.0%)
+WETH/USDC Pancake-100 -> UniV3-100 (b_to_a)         4        0.005                -0.0001              -0.0252       0 (0.0%)
+
+Key Route Findings:
+1. WETH/WBTC Pancake-100 -> Camelot-dyn (a_to_b):
+   At 0.01 WETH: spread = +2.13 bps -> Gross profit = 0.00000213 WETH (+$0.00533 USD).
+   At 0.02 WETH: spread = +1.86 bps -> Gross profit = 0.00000373 WETH (+$0.00934 USD).
+   Because total profit is higher at 0.02 WETH despite slight price slippage, the optimizer
+   correctly selected 0.02 WETH as the profit-maximizing size.
+   Net profit after L2+L1 gas ($0.02507) was -$0.0157 USD.
+
+2. WETH/USDC UniV3-100 -> Pancake-100 (a_to_b):
+   Best size: 0.005 WETH (Gross profit: +$0.00067 USD). Net profit after gas: -$0.0245 USD.
+
+--------------------------------------------------------------------------------
+7. LOGGED PROBES DETAIL (27 PROBES RECORDED)
+--------------------------------------------------------------------------------
+Below is the complete table of all 27 probes recorded during the bounded live test:
+
+#   Block       Pair       Route                       Dir     BestSize  Profit(WETH)  GrossUSD    GasUSD    NetUSD
+-----------------------------------------------------------------------------------------------------------------
+1   513584840   WETH/USDC  UniV3-100 -> Pancake-100    a_to_b  0.005 W   2.658e-7      +$0.00067   $0.02513  -$0.02446
+2   513584840   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02513  -$0.02551
+3   513584880   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02511  -$0.02549
+4   513584920   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02507  -$0.02545
+5   513584960   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02512  -$0.02549
+6   513585000   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02508  -$0.02545
+7   513585040   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02516  -$0.02553
+8   513585080   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02507  -$0.02545
+9   513585120   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02507  -$0.02545
+10  513585160   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02508  -$0.02546
+11  513585160   WETH/USDC  Pancake-100 -> UniV3-100    b_to_a  0.005 W  -2.880e-8      -$0.00007   $0.02508  -$0.02515
+12  513585200   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02512  -$0.02550
+13  513585200   WETH/USDC  Pancake-100 -> UniV3-100    b_to_a  0.005 W  -2.880e-8      -$0.00007   $0.02512  -$0.02519
+14  513585240   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02511  -$0.02549
+15  513585240   WETH/USDC  Pancake-100 -> UniV3-100    b_to_a  0.005 W  -2.880e-8      -$0.00007   $0.02511  -$0.02518
+16  513585280   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.005 W  -1.510e-7      -$0.00038   $0.02510  -$0.02548
+17  513585280   WETH/USDC  Pancake-100 -> UniV3-100    b_to_a  0.005 W  -2.880e-8      -$0.00007   $0.02510  -$0.02517
+18  513585320   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.742e-6      +$0.00436   $0.02510  -$0.02074
+19  513585360   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.742e-6      +$0.00436   $0.02507  -$0.02071
+20  513585400   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.080e-6      +$0.00271   $0.02511  -$0.02240
+21  513585440   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.080e-6      +$0.00271   $0.02508  -$0.02237
+22  513585480   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.080e-6      +$0.00271   $0.02507  -$0.02236
+23  513585520   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.080e-6      +$0.00271   $0.02507  -$0.02236
+24  513585560   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.080e-6      +$0.00271   $0.02507  -$0.02236
+25  513585600   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   1.080e-6      +$0.00271   $0.02519  -$0.02248
+26  513585640   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   3.727e-6      +$0.00934   $0.02507  -$0.01573
+27  513585680   WETH/WBTC  Pancake-100 -> Camelot-dyn  a_to_b  0.020 W   3.727e-6      +$0.00934   $0.02532  -$0.01599
+
+--------------------------------------------------------------------------------
+8. RPC ACCOUNTING (10 MARKETS)
+--------------------------------------------------------------------------------
+1. Per Processed Block (Standard evaluation without probes):
+   - Batch 1 (State fetch): 130 calls across 10 markets + reference price pool,
+     chunked at 35 calls/chunk = 4 Multicall3 RPC calls (eth_call).
+   - Batch 2 (Quoter execution): 276 pair quotes,
+     chunked at 45 calls/chunk = 7 Multicall3 RPC calls (eth_call).
+   - Total RPC calls per block: 11 RPC calls.
+
+2. Extra RPC Calls Per Size Probe:
+   - Gas price query (eth_gasPrice): 1 call.
+   - L1 data fee estimate (NodeInterface eth_call): 1 call.
+   - Multicall Batch A for probe ladder (9 quotes, chunked <= 45): 1 Multicall3 call.
+   - Multicall Batch B for probe ladder (9 quotes, chunked <= 45): 1 Multicall3 call.
+   - Total extra RPC calls per probe: 4 calls.
+
+3. Estimated Daily Compute Units (Alchemy / Infura):
+   - At sampling rate of ~1 block per 10s (8,640 blocks/day):
+     8,640 blocks * 11 calls = 95,040 calls/day.
+   - Probes overhead (~5% of blocks triggering ~432 probes/day):
+     432 * 4 = 1,728 extra calls/day.
+   - Total calls: ~96,768 calls/day.
+   - Compute Units (eth_call = 26 CU, eth_gasPrice = 19 CU):
+     ~96,768 * 26 CU ≈ 2.52 Million CU / day.
+   - Easily fits within standard Alchemy monthly quotas (300M CU / month).
+================================================================================

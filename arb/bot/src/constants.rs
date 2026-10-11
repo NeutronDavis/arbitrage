@@ -55,6 +55,20 @@ pub const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 /// Flash loan fee: currently 0 bps (governance can raise it; verify before production use).
 pub const BALANCER_VAULT: &str = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
 
+/// Balancer V2 ProtocolFeesCollector on Arbitrum One.
+/// Source: Retrieved on-chain from BALANCER_VAULT.getProtocolFeesCollector() on 2026-10-10.
+pub const BALANCER_PROTOCOL_FEES_COLLECTOR: &str = "0xce88686553686DA562CE7Cea497CE749DA109f9F";
+
+// ── Arbitrum Nitro Precompiles & Node Interfaces ──────────────────────────────
+
+/// Arbitrum NodeInterface for node-level gas and L1 calldata queries.
+/// Source: https://docs.arbitrum.io/build-decentralized-apps/precompiles/reference#nodeinterface
+pub const NODE_INTERFACE: &str = "0x00000000000000000000000000000000000000C8";
+
+/// Arbitrum ArbGasInfo precompile for L1/L2 gas parameters and pricing in wei.
+/// Source: https://docs.arbitrum.io/build-decentralized-apps/precompiles/reference#arbgasinfo
+pub const ARB_GAS_INFO: &str = "0x000000000000000000000000000000000000006c";
+
 // ── Uniswap V3 ────────────────────────────────────────────────────────────────
 
 /// Uniswap V3 Factory on Arbitrum One — used to look up pool addresses via `getPool`.
